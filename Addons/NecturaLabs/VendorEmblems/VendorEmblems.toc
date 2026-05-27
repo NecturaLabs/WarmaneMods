@@ -1,0 +1,7 @@
+## Interface: 30300
+## Title: VendorEmblems
+## Notes: Shows the token currencies accepted by the current vendor, with your balance, in the top-right of the merchant frame.
+## Author: Itai
+## Version: 1.0.0
+
+VendorEmblems.lua
