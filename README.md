@@ -7,5 +7,5 @@ Follow the instructions there on how to install them.<br/>
 [https://forum.warmane.com/showthread.php?t=433477](https://forum.warmane.com/showthread.php?t=433477)
 
 ## Safety Warning - Read before downloading Game Executables
-When downloading executables online you are <b>ENCOURAGED<b/> to scan them on VirusTotal first before running:
+When downloading executables online you are **ENCOURAGED** to scan them on VirusTotal first before running:
 <br/>[https://www.virustotal.com/gui](https://www.virustotal.com/gui)
