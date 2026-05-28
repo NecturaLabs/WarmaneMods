@@ -1,7 +1,7 @@
 ## Interface: 30300
 ## Title: VendorEmblems
-## Notes: Shows the token currencies accepted by the current vendor, with your balance, in the top-right of the merchant frame.
+## Notes: Sidebar extension on the right of the merchant frame listing every character currency and balance (grouped like the Character pane's Currency tab). Currencies the current vendor accepts are highlighted, and hovering shows which items they buy.
 ## Author: Itai
-## Version: 1.0.0
+## Version: 2.0.0
 
 VendorEmblems.lua
