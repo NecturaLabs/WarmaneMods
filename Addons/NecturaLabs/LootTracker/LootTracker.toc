@@ -1,0 +1,11 @@
+## Interface: 30300
+## Title: Loot Tracker
+## Notes: Tracks boss loot and /roll outcomes in dungeons and raids.
+## Author: Nectura
+## Version: 1.0.0
+## SavedVariablesPerCharacter: LootTrackerDB
+
+Data\Bosses.lua
+Data\Currencies.lua
+Core.lua
+UI.lua
