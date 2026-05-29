@@ -14,12 +14,22 @@ local LOOT_SESSION_QUEUE_LIMIT    = 8
 local LOOT_OPEN_FALLBACK_WINDOW   = 20
 local TRASH_BOSS_NAME             = "Trash"
 
+local TRADE_WINDOW_SECONDS        = 7200   -- WotLK 3.3.5 BoP trade window
+local TRADE_TIMER_TICK_SECONDS    = 30     -- minute-granularity display
+-- Thresholds (seconds remaining) at which a chat alert is emitted.
+-- Order matters: higher thresholds fire first as time ticks down.
+local TRADE_ALERT_THRESHOLDS = {
+    { key = "30m",     atOrBelow = 1800, label = "30m left to trade" },
+    { key = "10m",     atOrBelow =  600, label = "10m left to trade" },
+    { key = "1m",      atOrBelow =   60, label = "1m left to trade"  },
+    { key = "expired", atOrBelow =    0, label = "trade window expired" },
+}
+
 local nextSyntheticGuid = 0
 
 LT.classCache       = {}
 LT.currentSession   = nil
 LT.lastBossKill     = nil   -- { session, bossIndex, time, guid }
-LT.activeRollItem   = nil   -- { session, bossIndex, itemIndex, expiresAt }
 LT.candidateDeaths  = {}    -- recent unattributed NPC deaths
 LT.lootSessions     = {}    -- queue of { guid, npcId, name, time, items } from recent LOOT_OPENED snapshots
 LT.activeGroupRolls   = {}  -- [rollID] = { session, bossIndex, itemIndex, itemId, itemLink, startedAt, expiresAt }
@@ -47,7 +57,6 @@ local ResolveInferredBoss
 -- activeGroupRolls was introduced).
 local function ClearTransientState(self)
     self.lastBossKill     = nil
-    self.activeRollItem   = nil
     self.candidateDeaths  = {}
     self.lootSessions     = {}
     self.activeGroupRolls = {}
@@ -71,7 +80,6 @@ local LOOT_SELF_SINGLE   = BuildPattern(LOOT_ITEM_SELF           or "You receive
 local LOOT_SELF_MULTI    = BuildPattern(LOOT_ITEM_SELF_MULTIPLE  or "You receive loot: %sx%d.")
 local LOOT_OTHER_SINGLE  = BuildPattern(LOOT_ITEM                or "%s receives loot: %s.")
 local LOOT_OTHER_MULTI   = BuildPattern(LOOT_ITEM_MULTIPLE       or "%s receives loot: %sx%d.")
-local ROLL_PATTERN       = BuildPattern(RANDOM_ROLL_RESULT       or "%s rolls %d (%d-%d)")
 -- The "rolled N for [Item] [Type]" patterns CANNOT come from BuildPattern of
 -- LOOT_ROLL_ROLLED_*: Warmane (and likely other private servers) redefines
 -- those globals to the "Detailed Loot Information" format ("Type Roll - N for
@@ -157,11 +165,10 @@ local function FindItemInBoss(boss, itemId)
 end
 
 -- An item entry may already exist as a placeholder created by OnGroupLootRoll
--- (when players rolled before the winner received it) or OnItemLinkAnnounced
--- (master-loot pre-announce). Those placeholders have no recipient. On the
--- first actual receive, fill in the recipient instead of double-incrementing
--- the drop count. A *true* re-drop of the same item (same boss, recipient
--- already set) does increment count, as before.
+-- when players rolled before the winner received it. Those placeholders have
+-- no recipient. On the first actual receive, fill in the recipient instead of
+-- double-incrementing the drop count. A *true* re-drop of the same item (same
+-- boss, recipient already set) does increment count, as before.
 local function FillRecipientOrIncrement(existing, recipient, count)
     if not existing.recipient then
         existing.recipient = recipient
@@ -348,6 +355,10 @@ local function EnsureDB()
     -- copy-pasting from chat.
     LootTrackerDB.debugLog = LootTrackerDB.debugLog or {}
     LT.debugLog = LootTrackerDB.debugLog
+    LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
+    if LootTrackerDB.tradeTimers.enabled        == nil then LootTrackerDB.tradeTimers.enabled        = true  end
+    if LootTrackerDB.tradeTimers.alerts         == nil then LootTrackerDB.tradeTimers.alerts         = true  end
+    if LootTrackerDB.tradeTimers.panelCollapsed == nil then LootTrackerDB.tradeTimers.panelCollapsed = false end
 end
 
 local function LogDebug(msg)
@@ -1284,75 +1295,6 @@ function LT:OnLootReceived(recipient, itemLink, count)
     self:Fire("ItemReceived", self.currentSession, active, existing)
 end
 
--- ---------------------------------------------------------------------------
--- Roll association
--- ---------------------------------------------------------------------------
-
-function LT:OnItemLinkAnnounced(itemLink)
-    if not self.currentSession then return end
-    local itemId = GetItemIDFromLink(itemLink)
-    if not itemId then return end
-    -- Same quality gate as OnLootReceived — don't track grey/white items.
-    local announceQuality = GetItemQualityFromLink(itemLink)
-    if announceQuality and announceQuality < 2 then return end
-    if not EnsureBossContext(self, itemId) then return end
-
-    local session = self.lastBossKill.session
-    local boss = session.bosses[self.lastBossKill.bossIndex]
-    if not boss then return end
-
-    local idx, entry = FindItemInBoss(boss, itemId)
-    if not entry then
-        entry = {
-            itemId    = itemId,
-            itemLink  = itemLink,
-            count     = 1,
-            quality   = announceQuality,
-            droppedAt = Now(),
-            rolls     = {},
-        }
-        table.insert(boss.items, entry)
-        idx = #boss.items
-        self:Fire("ItemReceived", session, boss, entry)
-    end
-
-    self.activeRollItem = {
-        session   = session,
-        bossIndex = self.lastBossKill.bossIndex,
-        itemIndex = idx,
-        itemId    = itemId,
-    }
-end
-
-function LT:OnRoll(playerName, value, minRoll, maxRoll)
-    local active = self.activeRollItem
-    if not active then return end
-
-    local boss = active.session.bosses[active.bossIndex]
-    if not boss then return end
-    local item = boss.items[active.itemIndex]
-    if not item then return end
-
-    if not item.rolledBy then
-        item.rolledBy = {}
-        for _, r in ipairs(item.rolls) do item.rolledBy[r.player] = true end
-    end
-    if item.rolledBy[playerName] then return end
-    item.rolledBy[playerName] = true
-
-    table.insert(item.rolls, {
-        player       = playerName,
-        class        = self:GetPlayerClass(playerName),
-        value        = value,
-        minRoll      = minRoll,
-        maxRoll      = maxRoll,
-        time         = Now(),
-        equippedLink = GetEquippedForCompare(playerName, item.itemLink),
-    })
-    table.sort(item.rolls, function(a, b) return (a.value or 0) > (b.value or 0) end)
-    self:Fire("RollAdded", active.session, boss, item)
-end
-
 -- START_LOOT_ROLL fires on EVERY client eligible to roll on a group-loot
 -- item — not just the looter. This is the only signal a non-looter ever
 -- gets that an item is up for rolling (LOOT_OPENED only fires for the
@@ -1618,6 +1560,212 @@ function LT:OnGroupLootWon(recipient, itemLink)
 end
 
 -- ---------------------------------------------------------------------------
+-- Trade-window helpers
+-- ---------------------------------------------------------------------------
+
+-- Returns seconds remaining in the 2h trade window, or nil if past it / no
+-- droppedAt. Pure function — used by the ticker, the sticky panel, and the
+-- inline badge so all three agree on remaining time.
+function LT:GetTradeRemaining(item)
+    if not item or not item.droppedAt then return nil end
+    local remaining = TRADE_WINDOW_SECONDS - (Now() - item.droppedAt)
+    if remaining <= 0 then return nil end
+    return remaining
+end
+
+-- Format helper: "1h 47m" while > 1h, "47m" while > 5m, "4m 23s" in the last
+-- 5 minutes (so the player sees a meaningful change every second near the end).
+local function FormatTradeRemaining(remaining)
+    if remaining >= 3600 then
+        return string.format("%dh %02dm", math.floor(remaining / 3600),
+            math.floor((remaining % 3600) / 60))
+    elseif remaining > 300 then
+        return string.format("%dm", math.ceil(remaining / 60))
+    else
+        local mins = math.floor(remaining / 60)
+        local secs = math.floor(remaining % 60)
+        return string.format("%dm %02ds", mins, secs)
+    end
+end
+
+-- Color hex picked by urgency. See the spec's threshold table.
+local function ColorTradeRemaining(remaining)
+    if     remaining > 3600 then return "00ff00"  -- green
+    elseif remaining > 1800 then return "ffff00"  -- yellow
+    elseif remaining >  600 then return "ff8000"  -- orange
+    else                        return "ff0000"  -- red
+    end
+end
+
+-- Bundle the three numbers the UI needs. Returns nil if the item is past
+-- its window so the caller can branch cleanly on "show timer or not".
+function LT:GetTradeTimerStatus(item)
+    local remaining = self:GetTradeRemaining(item)
+    if not remaining then return nil end
+    return {
+        remainingSec = remaining,
+        text         = FormatTradeRemaining(remaining),
+        color        = ColorTradeRemaining(remaining),
+    }
+end
+
+-- Flat sorted list for the sticky panel. Soonest-expiring first.
+function LT:GetActiveTradeTimers(session)
+    if not session or not session.bosses then return {} end
+    local result = {}
+    for _, boss in ipairs(session.bosses) do
+        for _, item in ipairs(boss.items) do
+            local remaining = self:GetTradeRemaining(item)
+            if remaining then
+                result[#result + 1] = {
+                    item         = item,
+                    boss         = boss,
+                    remainingSec = remaining,
+                }
+            end
+        end
+    end
+    table.sort(result, function(a, b) return a.remainingSec < b.remainingSec end)
+    return result
+end
+
+-- ---------------------------------------------------------------------------
+-- Trade-window ticker
+-- ---------------------------------------------------------------------------
+
+-- Print a single chat alert. Matches the existing |cffffd200LootTracker|r
+-- prefix used by debug output so users recognise the source. The separator
+-- between item link and label is a plain ASCII hyphen: WoW 3.3.5's chat
+-- frame renders the em-dash UTF-8 byte sequence (\xe2\x80\x94) as garbled
+-- text on most fonts/locales.
+local function PrintTradeAlert(item, label)
+    if not item or not item.itemLink then return end
+    DEFAULT_CHAT_FRAME:AddMessage(string.format(
+        "|cffffd200LootTracker|r %s - %s",
+        item.itemLink, label))
+end
+
+-- Walk existing items at AddonLoaded and mark every already-crossed threshold
+-- as alerted WITHOUT firing chat. Suppresses the chat-flood that would
+-- otherwise happen the first time the user reloads after installing this
+-- feature (potentially dozens of items × four thresholds each), or after
+-- the addon was disabled long enough for many items to cross thresholds
+-- while it wasn't watching.
+--
+-- Freshly-dropped items added AFTER this runs (via OnLootReceived) start
+-- with no alertedThresholds; TickTradeTimers lazy-inits the field there and
+-- their remaining time is still > every threshold, so no thresholds get
+-- pre-marked and alerts fire normally as time crosses each one.
+local function SeedAlertedThresholds()
+    EnsureDB()
+    local now = Now()
+    for _, session in ipairs(LootTrackerDB.sessions or {}) do
+        for _, boss in ipairs(session.bosses) do
+            for _, item in ipairs(boss.items) do
+                if item.droppedAt and not item.alertedThresholds then
+                    item.alertedThresholds = {}
+                    local remaining = TRADE_WINDOW_SECONDS - (now - item.droppedAt)
+                    for _, th in ipairs(TRADE_ALERT_THRESHOLDS) do
+                        if remaining <= th.atOrBelow then
+                            item.alertedThresholds[th.key] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local tradeTickerFrame
+local tradeTickerElapsed = 0
+
+local function TickTradeTimers()
+    EnsureDB()
+    local alertsOn = LootTrackerDB.tradeTimers
+        and LootTrackerDB.tradeTimers.alerts
+    local anyLive = false
+    local anyAlertFired = false
+    local now = Now()
+
+    for _, session in ipairs(LootTrackerDB.sessions or {}) do
+        for _, boss in ipairs(session.bosses) do
+            for _, item in ipairs(boss.items) do
+                if item.droppedAt then
+                    item.alertedThresholds = item.alertedThresholds or {}
+                    -- Skip items already past the window AND already alerted
+                    -- about expiry. Everything else still needs threshold
+                    -- checks — including items currently past expiry but not
+                    -- yet alerted (addon was disabled when the boundary was
+                    -- crossed, or this is the first tick after a fresh login
+                    -- with a pre-existing expired item).
+                    if not item.alertedThresholds.expired then
+                        local remaining = TRADE_WINDOW_SECONDS - (now - item.droppedAt)
+                        if remaining > 0 then anyLive = true end
+                        -- remaining can be negative here; the threshold list
+                        -- includes an entry with atOrBelow = 0 ("expired") so
+                        -- the loop catches the expired transition uniformly.
+                        for _, th in ipairs(TRADE_ALERT_THRESHOLDS) do
+                            if remaining <= th.atOrBelow
+                                and not item.alertedThresholds[th.key]
+                            then
+                                -- Bag-presence gate: only chat-alert for items
+                                -- currently in the player's bags. Suppresses
+                                -- alerts for items already traded away, items
+                                -- looted by other players, and items stashed
+                                -- in the bank/mail. GetItemCount default scope
+                                -- is bags only (bank/charges excluded).
+                                if alertsOn
+                                    and GetItemCount(item.itemId) > 0
+                                then
+                                    PrintTradeAlert(item, th.label)
+                                end
+                                -- Always record the threshold, even when alerts
+                                -- are suppressed (off, or item not in bags), so
+                                -- re-enabling alerts or re-acquiring the item
+                                -- doesn't replay historical thresholds.
+                                item.alertedThresholds[th.key] = true
+                                anyAlertFired = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Fire only when something changed: at least one item is still live (so
+    -- its display text may need updating) or an alert just fired (UI may need
+    -- to drop a row from the sticky panel). Skipping the no-op fire keeps the
+    -- UI from doing pointless reflows once everything has expired.
+    if anyLive or anyAlertFired then
+        LT:Fire("TradeTimerTick")
+    end
+
+    if not anyLive and tradeTickerFrame then
+        tradeTickerFrame:Hide()
+    end
+end
+
+-- Lazily creates and shows the ticker. Called from AddonLoaded and from
+-- OnLootReceived (post-attribution) so new drops re-start a stopped ticker.
+function LT:StartTradeTimerTicker()
+    if not tradeTickerFrame then
+        tradeTickerFrame = CreateFrame("Frame")
+        tradeTickerFrame:SetScript("OnUpdate", function(_, dt)
+            tradeTickerElapsed = tradeTickerElapsed + dt
+            if tradeTickerElapsed < TRADE_TIMER_TICK_SECONDS then return end
+            tradeTickerElapsed = 0
+            TickTradeTimers()
+        end)
+    end
+    -- Run one tick immediately so the UI / alerts react without waiting 30s
+    -- for the first OnUpdate after a fresh login.
+    tradeTickerElapsed = 0
+    TickTradeTimers()
+    tradeTickerFrame:Show()
+end
+
+-- ---------------------------------------------------------------------------
 -- Public API
 -- ---------------------------------------------------------------------------
 
@@ -1641,14 +1789,14 @@ function LT:GenerateMockData()
             equippedLink = equipId and mkLink(equipId, equipName, "a335ee") or nil,
         }
     end
-    local function mkItem(id, name, qHex, quality, expanded, rolls)
+    local function mkItem(id, name, qHex, quality, expanded, rolls, droppedAtOverride)
         local rolledBy = {}
         for _, r in ipairs(rolls) do rolledBy[r.player] = true end
         table.sort(rolls, function(a, b) return (a.value or 0) > (b.value or 0) end)
         return {
             itemId = id, itemLink = mkLink(id, name, qHex),
             count = 1, quality = quality, expanded = expanded,
-            droppedAt = now, rolls = rolls, rolledBy = rolledBy,
+            droppedAt = droppedAtOverride or now, rolls = rolls, rolledBy = rolledBy,
         }
     end
 
@@ -1694,11 +1842,11 @@ function LT:GenerateMockData()
                 mkRoll("Stabbystab",   "ROGUE",       55,  39417, "Death's Bite", "Greed"),
                 mkRoll("Sneakkitty",   "DRUID",       nil, 39417, "Death's Bite", "Pass"),
                 mkRoll("Pewpewlazor",  "PALADIN",     12,  39417, "Death's Bite", "Need"),
-            }),
+            }, now - 1200),  -- 20m elapsed → 1h 40m left (green)
             mkItem(49835, "Splintered Door of the Citadel", "a335ee", 4, false, {
                 mkRoll("Pewpewlazor", "PALADIN", 88,  40400, "Wall of Terror", "Need"),
                 mkRoll("Gronkar",     "WARRIOR", 45,  40400, "Wall of Terror", "Greed"),
-            }),
+            }, now - 300),   -- 5m elapsed → 1h 55m left (green)
         },
     })
 
@@ -1710,7 +1858,7 @@ function LT:GenerateMockData()
                 mkRoll("Lightheal",  "PRIEST",  91,  39515, "Heroes' Robe of Faith", "Need"),
                 mkRoll("Frostybolt", "MAGE",    73,  39515, "Heroes' Robe of Faith", "Greed"),
                 mkRoll("Doomtroll",  "WARLOCK", 42,  39515, "Heroes' Robe of Faith", "Disenchant"),
-            }),
+            }, now - 5400),  -- 90m elapsed → 30m left (orange/yellow edge)
         },
     })
 
@@ -1722,17 +1870,23 @@ function LT:GenerateMockData()
                 mkRoll("Plaguebearer", "DEATHKNIGHT", 99,  47078, "Justicebringer", "Need"),
                 mkRoll("Gronkar",      "WARRIOR",     56,  47078, "Justicebringer", "Need"),
                 mkRoll("Pewpewlazor",  "PALADIN",     33,  47078, "Justicebringer", "Need"),
-            }),
+            }, now - 6750),  -- 112.5m elapsed → 7.5m left (red, close to pulse)
             mkItem(50402, "Ashen Band of Endless Vengeance", "a335ee", 4, false, {
                 mkRoll("Bowsong",    "HUNTER", 87,  40718, "Signet of the Impregnable Fortress", "Need"),
                 mkRoll("Shockwave",  "SHAMAN", 35,  40718, "Signet of the Impregnable Fortress", "Greed"),
                 mkRoll("Stabbystab", "ROGUE",  nil, 40718, "Signet of the Impregnable Fortress", "Pass"),
-            }),
+            }, now - 7400),  -- past 2h: no timer
         },
     })
 
     table.insert(LootTrackerDB.sessions, session)
+    -- Mock items are backdated by design (see droppedAt overrides above) so
+    -- their timers span every color band. Without this, StartTradeTimerTicker
+    -- below would chat-flood the user with every threshold those backdated
+    -- items have already crossed. Seed silently before the first tick.
+    SeedAlertedThresholds()
     self:Fire("SessionChanged")
+    self:StartTradeTimerTicker()
 end
 
 function LT:DeleteSession(sessionId)
@@ -1952,11 +2106,6 @@ eventFrame:RegisterEvent("START_LOOT_ROLL")
 eventFrame:RegisterEvent("CANCEL_LOOT_ROLL")
 eventFrame:RegisterEvent("CHAT_MSG_LOOT")
 eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
-eventFrame:RegisterEvent("CHAT_MSG_RAID")
-eventFrame:RegisterEvent("CHAT_MSG_RAID_LEADER")
-eventFrame:RegisterEvent("CHAT_MSG_RAID_WARNING")
-eventFrame:RegisterEvent("CHAT_MSG_PARTY")
-eventFrame:RegisterEvent("CHAT_MSG_PARTY_LEADER")
 eventFrame:RegisterEvent("PARTY_MEMBERS_CHANGED")
 eventFrame:RegisterEvent("RAID_ROSTER_UPDATE")
 eventFrame:RegisterEvent("INSPECT_TALENT_READY")
@@ -1968,6 +2117,15 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             EnsureDB()
             LT:RefreshClassCache()
             LT:Fire("AddonLoaded")
+            -- Seed thresholds on existing items BEFORE the first ticker fire,
+            -- so any historic items that have already passed thresholds don't
+            -- chat-flood the user on first reload.
+            SeedAlertedThresholds()
+            -- Re-kick the ticker whenever a new drop lands, in case it had
+            -- stopped after the last live timer expired. StartTradeTimerTicker
+            -- is idempotent — safe to call on every receive.
+            LT:On("ItemReceived", function() LT:StartTradeTimerTicker() end)
+            LT:StartTradeTimerTicker()
         end
     elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
         LT:RefreshClassCache()
@@ -1998,13 +2156,6 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             LogDebug("loot out: recipient=" .. tostring(recipient)
                 .. " link=" .. tostring(link))
             LT:OnLootReceived(recipient, link, count)
-            local active = LT.activeRollItem
-            if active then
-                local receivedId = GetItemIDFromLink(link)
-                if receivedId and active.itemId == receivedId then
-                    LT.activeRollItem = nil
-                end
-            end
         else
             -- "Won" announcements first — they share CHAT_MSG_LOOT with the
             -- "rolled" messages but carry the final recipient, not a roll
@@ -2031,31 +2182,17 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             end
         end
     elseif event == "CHAT_MSG_SYSTEM" then
+        -- "<Instance> has been reset." — flag the instance so the next
+        -- OnZoneChanged into it starts a fresh session instead of rejoining
+        -- the recent one via FindRecentMatchingSession. Assumes the system
+        -- message's instance name matches GetInstanceInfo()'s value
+        -- case-insensitively (true for enUS WotLK 3.3.5; some private
+        -- servers append difficulty suffixes like " (10)" which would
+        -- break the match — out of scope per the addon's enUS policy).
         local text = ...
-        local n, v, mn, mx = text:match(ROLL_PATTERN)
-        if n and v then
-            LT:OnRoll(n, tonumber(v), tonumber(mn), tonumber(mx))
-        else
-            -- "<Instance> has been reset." — flag the instance so the next
-            -- OnZoneChanged into it starts a fresh session instead of rejoining
-            -- the recent one via FindRecentMatchingSession. Assumes the system
-            -- message's instance name matches GetInstanceInfo()'s value
-            -- case-insensitively (true for enUS WotLK 3.3.5; some private
-            -- servers append difficulty suffixes like " (10)" which would
-            -- break the match — out of scope per the addon's enUS policy).
-            local resetName = text:match(INSTANCE_RESET)
-            if resetName then
-                LT.resetInstanceNames[resetName:lower()] = true
-            end
+        local resetName = text:match(INSTANCE_RESET)
+        if resetName then
+            LT.resetInstanceNames[resetName:lower()] = true
         end
-    elseif event == "CHAT_MSG_RAID"
-        or event == "CHAT_MSG_RAID_LEADER"
-        or event == "CHAT_MSG_RAID_WARNING"
-        or event == "CHAT_MSG_PARTY"
-        or event == "CHAT_MSG_PARTY_LEADER"
-    then
-        local text = ...
-        local link = text:match(ITEM_LINK_FULL)
-        if link then LT:OnItemLinkAnnounced(link) end
     end
 end)

@@ -1,6 +1,6 @@
 local LT = _G.LootTracker
 
-local FRAME_WIDTH_MIN   = 300
+local FRAME_WIDTH_MIN   = 320
 local FRAME_WIDTH_MAX   = 640
 local FRAME_HEIGHT      = 500
 local PAD               = 10
@@ -16,6 +16,16 @@ local PASS_TEX          = "Interface\\Buttons\\UI-GroupLoot-Pass-Up"
 local UNKNOWN_ICON      = "Interface\\Icons\\INV_Misc_QuestionMark"
 local PLUS_TEX          = "Interface\\Buttons\\UI-PlusButton-Up"
 local MINUS_TEX         = "Interface\\Buttons\\UI-MinusButton-Up"
+local HOURGLASS_TEX     = "Interface\\Icons\\INV_Misc_PocketWatch_01"
+
+local STICKY_PANEL_ROW_H    = 18
+local STICKY_PANEL_HEADER_H = 20
+local STICKY_PANEL_GAP_BOT  = 4
+-- Hard cap on visible rows so the sticky panel can't grow past the frame's
+-- bottom edge. With FRAME_HEIGHT=500 and the panel anchored at y=-94, 10 rows
+-- (20 + 10*18 + 4 = 204px) leaves ~190px for the scroll viewport below it.
+-- Items past the cap are not rendered; the header indicates truncation.
+local STICKY_PANEL_MAX_ROWS = 10
 
 local ROLL_TYPE_TEX = {
     Need       = DICE_TEX,
@@ -158,6 +168,131 @@ UpdateTabVisuals = function()
 end
 UpdateTabVisuals()
 
+-- ---------------------------------------------------------------------------
+-- Sticky "Trade Window" panel (above the scroll viewport, Bosses tab only)
+-- ---------------------------------------------------------------------------
+
+local tradePanel = CreateFrame("Frame", "LootTrackerTradePanel", frame)
+tradePanel:SetPoint("TOPLEFT", PAD, -94)
+tradePanel:SetPoint("TOPRIGHT", -28, -94)
+tradePanel:Hide()
+
+local tradePanelBg = tradePanel:CreateTexture(nil, "BACKGROUND")
+tradePanelBg:SetAllPoints()
+tradePanelBg:SetTexture(0.10, 0.10, 0.18, 0.55)
+
+local tradePanelHeader = CreateFrame("Button", nil, tradePanel)
+tradePanelHeader:SetHeight(STICKY_PANEL_HEADER_H)
+tradePanelHeader:SetPoint("TOPLEFT", 0, 0)
+tradePanelHeader:SetPoint("TOPRIGHT", 0, 0)
+tradePanelHeader:RegisterForClicks("LeftButtonUp")
+
+local tradePanelHourglass = tradePanelHeader:CreateTexture(nil, "ARTWORK")
+tradePanelHourglass:SetSize(14, 14)
+tradePanelHourglass:SetPoint("LEFT", 4, 0)
+tradePanelHourglass:SetTexture(HOURGLASS_TEX)
+tradePanelHourglass:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+local tradePanelTitle = tradePanelHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+tradePanelTitle:SetPoint("LEFT", tradePanelHourglass, "RIGHT", 6, 0)
+
+local tradePanelCaret = tradePanelHeader:CreateTexture(nil, "ARTWORK")
+tradePanelCaret:SetSize(14, 14)
+tradePanelCaret:SetPoint("RIGHT", -4, 0)
+
+-- Indexed by render slot (1..N), unlike bossHeaderPool / itemRowPool / rollRowPool
+-- which use Acquire(pool, factory) with an inUse flag. Trade rows are rendered
+-- in a single deterministic pass each Refresh, so slot identity == pool index.
+local tradeRowPool = {}
+
+local function MakeTradeRow()
+    local r = CreateFrame("Button", nil, tradePanel)
+    r:SetHeight(STICKY_PANEL_ROW_H)
+    r:RegisterForClicks("LeftButtonUp")
+
+    local hl = r:CreateTexture(nil, "HIGHLIGHT")
+    hl:SetAllPoints()
+    hl:SetTexture(1, 1, 1, 0.06)
+    hl:SetBlendMode("ADD")
+
+    r.icon = r:CreateTexture(nil, "ARTWORK")
+    r.icon:SetSize(12, 12)
+    r.icon:SetPoint("LEFT", 6, 0)
+    r.icon:SetTexture(HOURGLASS_TEX)
+    r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+    r.timer = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    r.timer:SetPoint("LEFT", r.icon, "RIGHT", 4, 0)
+    r.timer:SetWidth(64)
+    r.timer:SetJustifyH("LEFT")
+
+    r.nameText = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    r.nameText:SetPoint("LEFT", r.timer, "RIGHT", 4, 0)
+    r.nameText:SetPoint("RIGHT", -4, 0)
+    r.nameText:SetJustifyH("LEFT")
+
+    r:SetScript("OnEnter", function(self)
+        if not self.itemLink then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetHyperlink(self.itemLink)
+        if self.remainingSec and self.droppedAt then
+            local mins = math.floor(self.remainingSec / 60)
+            local secs = math.floor(self.remainingSec % 60)
+            GameTooltip:AddLine(" ")
+            GameTooltip:AddLine(string.format(
+                "Trade window: %dm %02ds remaining", mins, secs), 1, 1, 1)
+            GameTooltip:AddLine(string.format(
+                "Expires at %s", date("%I:%M:%S %p", self.droppedAt + 7200)),
+                0.7, 0.7, 0.7)
+        end
+        GameTooltip:Show()
+    end)
+    r:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    r:SetScript("OnMouseDown", function(self, button)
+        if button ~= "LeftButton" then return end
+        if not self.itemLink then return end
+        if IsModifiedClick("CHATLINK") then
+            local activeEdit = ChatEdit_GetActiveWindow and ChatEdit_GetActiveWindow()
+            if activeEdit then
+                activeEdit:Insert(self.itemLink)
+            else
+                ChatFrame_OpenChat(self.itemLink)
+            end
+        end
+    end)
+
+    r:Hide()
+    return r
+end
+
+local function AcquireTradeRow(i)
+    local r = tradeRowPool[i]
+    if not r then
+        r = MakeTradeRow()
+        tradeRowPool[i] = r
+    end
+    return r
+end
+
+local function ReleaseTradeRowsFrom(i)
+    for j = i, #tradeRowPool do
+        local r = tradeRowPool[j]
+        if r then
+            r:Hide()
+            r:ClearAllPoints()
+            r.itemLink = nil
+        end
+    end
+end
+
+tradePanelHeader:SetScript("OnClick", function()
+    LootTrackerDB = LootTrackerDB or {}
+    LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
+    LootTrackerDB.tradeTimers.panelCollapsed = not LootTrackerDB.tradeTimers.panelCollapsed
+    if Refresh then Refresh() end
+end)
+
 local scroll = CreateFrame("ScrollFrame", "LootTrackerScroll", frame, "UIPanelScrollFrameTemplate")
 scroll:SetPoint("TOPLEFT", PAD, -94)
 scroll:SetPoint("BOTTOMRIGHT", -28, PAD + 2)
@@ -242,6 +377,42 @@ local function MakeItemRow()
     r.nameText:SetPoint("LEFT", r.icon, "RIGHT", 6, 0)
     r.nameText:SetPoint("RIGHT", -4, 0)
     r.nameText:SetJustifyH("LEFT")
+
+    r.timerFrame = CreateFrame("Frame", nil, r)
+    r.timerFrame:SetSize(72, ROW_ITEM)
+    r.timerFrame:SetPoint("RIGHT", -4, 0)
+    r.timerFrame:EnableMouse(true)
+    r.timerFrame:Hide()
+
+    r.timerIcon = r.timerFrame:CreateTexture(nil, "ARTWORK")
+    r.timerIcon:SetSize(12, 12)
+    r.timerIcon:SetPoint("LEFT", 0, 0)
+    r.timerIcon:SetTexture(HOURGLASS_TEX)
+    r.timerIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+    r.timerText = r.timerFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    r.timerText:SetPoint("LEFT", r.timerIcon, "RIGHT", 4, 0)
+    r.timerText:SetPoint("RIGHT", 0, 0)
+    r.timerText:SetJustifyH("LEFT")
+
+    r.timerFrame:SetScript("OnEnter", function(self)
+        local item = r.item
+        if not item then return end
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:AddLine(item.itemLink or "?", 1, 1, 1)
+        local remaining = LT:GetTradeRemaining(item)
+        if remaining then
+            local mins = math.floor(remaining / 60)
+            local secs = math.floor(remaining % 60)
+            GameTooltip:AddLine(string.format(
+                "Trade window: %dm %02ds remaining", mins, secs), 1, 1, 1)
+            GameTooltip:AddLine(string.format(
+                "Expires at %s", date("%I:%M:%S %p", item.droppedAt + 7200)),
+                0.7, 0.7, 0.7)
+        end
+        GameTooltip:Show()
+    end)
+    r.timerFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     r:Hide()
 
@@ -341,6 +512,13 @@ local function ReleaseAll()
             r:Hide()
             r:ClearAllPoints()
             r.item, r.itemLink = nil, nil
+            if r.timerFrame then
+                if r.timerFrame.pulseStarted then
+                    r.timerFrame:SetScript("OnUpdate", nil)
+                    r.timerFrame.pulseStarted = false
+                end
+                r.timerFrame:Hide()
+            end
         end
     end
     for _, r in ipairs(rollRowPool) do
@@ -495,6 +673,28 @@ local function BuildCogMenu()
     local current = GetDisplaySession()
     return {
         { text = "Loot Tracker", isTitle = true, notCheckable = true },
+        { text = "Trade timers", isNotRadio = true, keepShownOnClick = true,
+          checked = function()
+              return LootTrackerDB and LootTrackerDB.tradeTimers
+                  and LootTrackerDB.tradeTimers.enabled
+          end,
+          func = function()
+              LootTrackerDB = LootTrackerDB or {}
+              LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
+              LootTrackerDB.tradeTimers.enabled = not LootTrackerDB.tradeTimers.enabled
+              if Refresh then Refresh() end
+          end },
+        { text = "Mute trade alerts", isNotRadio = true, keepShownOnClick = true,
+          checked = function()
+              return LootTrackerDB and LootTrackerDB.tradeTimers
+                  and not LootTrackerDB.tradeTimers.alerts
+          end,
+          func = function()
+              LootTrackerDB = LootTrackerDB or {}
+              LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
+              LootTrackerDB.tradeTimers.alerts = not LootTrackerDB.tradeTimers.alerts
+          end },
+        { text = "", notCheckable = true, disabled = true },
         { text = "Generate mock data", notCheckable = true,
           func = function()
               LT:GenerateMockData()
@@ -620,6 +820,47 @@ local function RenderItemRowAt(item, width, y)
     row.expand:SetTexture(item.expanded and MINUS_TEX or PLUS_TEX)
     row.icon:ClearAllPoints()
     row.icon:SetPoint("LEFT", 24, 0)
+
+    local status = LT:GetTradeTimerStatus(item)
+    local timersEnabled = LootTrackerDB and LootTrackerDB.tradeTimers
+        and LootTrackerDB.tradeTimers.enabled
+    if status and timersEnabled then
+        row.timerText:SetText(string.format("|cff%s%s|r", status.color, status.text))
+        row.timerFrame:SetAlpha(1)
+        row.timerFrame:Show()
+        row.nameText:ClearAllPoints()
+        row.nameText:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
+        row.nameText:SetPoint("RIGHT", row.timerFrame, "LEFT", -4, 0)
+
+        -- Last-minute pulse: alpha-modulate the badge so the player sees the
+        -- final 60s visually, not just numerically. Started lazily; stopped
+        -- once the remaining time climbs back above (never naturally) or the
+        -- row is released to its pool (see ReleaseAll).
+        if status.remainingSec <= 60 then
+            if not row.timerFrame.pulseStarted then
+                local elapsed = 0
+                row.timerFrame:SetScript("OnUpdate", function(self, dt)
+                    elapsed = elapsed + dt
+                    self:SetAlpha(0.4 + 0.6 * (math.sin(elapsed * 4) * 0.5 + 0.5))
+                end)
+                row.timerFrame.pulseStarted = true
+            end
+        elseif row.timerFrame.pulseStarted then
+            row.timerFrame:SetScript("OnUpdate", nil)
+            row.timerFrame:SetAlpha(1)
+            row.timerFrame.pulseStarted = false
+        end
+    else
+        if row.timerFrame.pulseStarted then
+            row.timerFrame:SetScript("OnUpdate", nil)
+            row.timerFrame.pulseStarted = false
+        end
+        row.timerFrame:Hide()
+        row.nameText:ClearAllPoints()
+        row.nameText:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
+        row.nameText:SetPoint("RIGHT", -4, 0)
+    end
+
     row:Show()
 end
 
@@ -768,6 +1009,13 @@ local function RenderAggregateTab(bucket, emptyText)
         row.expand:Hide()
         row.icon:ClearAllPoints()
         row.icon:SetPoint("LEFT", 4, 0)
+        if row.timerFrame then
+            if row.timerFrame.pulseStarted then
+                row.timerFrame:SetScript("OnUpdate", nil)
+                row.timerFrame.pulseStarted = false
+            end
+            row.timerFrame:Hide()
+        end
 
         -- Sort recipients by descending count for the parenthetical breakdown.
         local rNames = {}
@@ -807,6 +1055,97 @@ local function ResetFrameWidthToMin()
     end
 end
 
+-- Render the sticky trade-window panel and return its outer height so the
+-- caller can offset the scroll viewport's top edge. Returns 0 when hidden.
+local function RenderTradePanel(session)
+    local timers = session and LT:GetActiveTradeTimers(session) or {}
+    local enabled = LootTrackerDB and LootTrackerDB.tradeTimers
+        and LootTrackerDB.tradeTimers.enabled
+    if not enabled or activeTab ~= TAB_BOSSES or #timers == 0 then
+        tradePanel:Hide()
+        ReleaseTradeRowsFrom(1)
+        return 0
+    end
+
+    local collapsed = LootTrackerDB.tradeTimers.panelCollapsed
+    tradePanelCaret:SetTexture(collapsed and PLUS_TEX or MINUS_TEX)
+
+    if collapsed then
+        tradePanelTitle:SetText(string.format(
+            "|cffffd200Trade Window (%d %s)|r",
+            #timers, (#timers == 1) and "item" or "items"))
+        ReleaseTradeRowsFrom(1)
+        tradePanel:SetHeight(STICKY_PANEL_HEADER_H)
+        tradePanel:Show()
+        return STICKY_PANEL_HEADER_H + STICKY_PANEL_GAP_BOT
+    end
+
+    -- Track rendered slot separately from list index so an item whose status
+    -- flips to nil mid-render (caught the exact expiry boundary between
+    -- GetActiveTradeTimers and per-item GetTradeTimerStatus) doesn't leave a
+    -- stale acquired row at index i. Without this, the pool slot at i would
+    -- still be marked Shown from its previous render and overlap the next
+    -- successfully rendered row.
+    local renderedCount = 0
+    local eligibleCount = 0
+    local y = STICKY_PANEL_HEADER_H
+    for _, info in ipairs(timers) do
+        local status = LT:GetTradeTimerStatus(info.item)
+        if status then
+            eligibleCount = eligibleCount + 1
+            if renderedCount < STICKY_PANEL_MAX_ROWS then
+                renderedCount = renderedCount + 1
+                local r = AcquireTradeRow(renderedCount)
+                r:SetPoint("TOPLEFT", 0, -y)
+                r:SetPoint("TOPRIGHT", 0, -y)
+                r.itemLink     = info.item.itemLink
+                r.droppedAt    = info.item.droppedAt
+                r.remainingSec = status.remainingSec
+                r.timer:SetText(string.format("|cff%s%s|r", status.color, status.text))
+                r.nameText:SetText(info.item.itemLink or "?")
+                r:Show()
+                y = y + STICKY_PANEL_ROW_H
+            end
+        end
+    end
+    ReleaseTradeRowsFrom(renderedCount + 1)
+
+    -- Header reflects truncation when more items qualify than fit. The
+    -- header count uses eligibleCount (post-status filter) rather than
+    -- #timers so a momentary expiry-boundary race doesn't mis-report.
+    if eligibleCount > renderedCount then
+        tradePanelTitle:SetText(string.format(
+            "|cffffd200Trade Window (%d items, showing %d soonest)|r",
+            eligibleCount, renderedCount))
+    else
+        tradePanelTitle:SetText(string.format(
+            "|cffffd200Trade Window (%d %s)|r",
+            eligibleCount, (eligibleCount == 1) and "item" or "items"))
+    end
+
+    if renderedCount == 0 then
+        -- Every item in `timers` flipped past expiry between the initial scan
+        -- and the render pass (extreme edge case). Hide the panel entirely
+        -- rather than show an empty body.
+        tradePanel:Hide()
+        return 0
+    end
+
+    tradePanel:SetHeight(y)
+    tradePanel:Show()
+    return y + STICKY_PANEL_GAP_BOT
+end
+
+-- Re-anchor the scroll viewport based on the sticky panel's current height.
+-- The panel itself is anchored once at construction time and only changes
+-- its height; here we only need to push the scroll's TOPLEFT down by the
+-- panel's current outer height so the two don't overlap.
+local function PositionScroll(stickyH)
+    scroll:ClearAllPoints()
+    scroll:SetPoint("TOPLEFT", PAD, -94 - stickyH)
+    scroll:SetPoint("BOTTOMRIGHT", -28, PAD + 2)
+end
+
 Refresh = function(reason)
     if not frame:IsShown() then return end
 
@@ -814,6 +1153,10 @@ Refresh = function(reason)
 
     ReleaseAll()
     local session = GetDisplaySession()
+
+    local stickyH = RenderTradePanel(session)
+    PositionScroll(stickyH)
+
     if not session then
         HidePlaceholderTabLabel()
         emptyLabel:Show()
@@ -907,6 +1250,7 @@ LT:On("ItemReceived",      OnDataChanged)
 LT:On("RollAdded",         OnDataChanged)
 LT:On("CurrencyReceived",  OnDataChanged)
 LT:On("MaterialReceived",  OnDataChanged)
+LT:On("TradeTimerTick",    OnDataChanged)
 
 -- INSPECT_TALENT_READY can fire several times per second in raids (other
 -- addons doing their own inspects also trigger it). Debounce so we don't
@@ -946,6 +1290,12 @@ SlashCmdList["LOOTTRACKER"] = function(msg)
     elseif cmd == "mock" then
         LT:GenerateMockData()
         if not frame:IsShown() then frame:Show() else Refresh() end
+    elseif cmd == "mute" then
+        LootTrackerDB = LootTrackerDB or {}
+        LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
+        LootTrackerDB.tradeTimers.alerts = not LootTrackerDB.tradeTimers.alerts
+        local state = LootTrackerDB.tradeTimers.alerts and "unmuted" or "muted"
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffd200LootTracker|r: trade alerts " .. state)
     elseif cmd == "debug" then
         LT.debug = not LT.debug
         if LT.debug then
@@ -967,6 +1317,6 @@ SlashCmdList["LOOTTRACKER"] = function(msg)
                 .. n .. " debug log lines.")
         end
     else
-        DEFAULT_CHAT_FRAME:AddMessage("|cffffd200LootTracker|r: /lt [toggle|show|hide|reset|mock|debug|logclear]")
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffd200LootTracker|r: /lt [toggle|show|hide|reset|mock|mute|debug|logclear]")
     end
 end
