@@ -903,7 +903,10 @@ local function RenderRollRowAt(roll, width, y, parentItem)
     rr.dice:SetTexCoord(0, 1, 0, 1)
 
     if roll.rollType == "Pass" then
-        rr.rollText:SetText("|cff8888880|r")
+        -- Passes have no numeric roll; the dice icon already conveys "Pass".
+        -- Leave the value column blank — the prior "0" placeholder added visual
+        -- noise that read like a real roll of zero.
+        rr.rollText:SetText("")
     elseif roll.value == nil then
         -- Intent-only entry: the player selected Need/Greed/Disenchant but
         -- the server never broadcast the numeric roll (3.3.5 suppresses

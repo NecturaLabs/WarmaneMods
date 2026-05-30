@@ -1533,14 +1533,31 @@ LootTracker_Bosses[17848] = {
     [28215]=1,[29434]=1,[30589]=1,[30590]=1,[30591]=1,},
 }
 
+-- The loot table below was originally generated for NPC 17862 (Skarloc)
+-- because tools/build_db.py had "cothillsbradhunter" mis-mapped to 17862.
+-- It's actually Epoch Hunter's loot. Both entries share the table so the
+-- snapshot-first attribution in Core.lua routes drops to the correct boss
+-- based on the actual NPC corpse; the DB walk falls through to either when
+-- snapshot isn't available. After the next `python tools/build_db.py` run
+-- this duplication should resolve to the correct npcId-only mapping for
+-- 18096 (and 17862 may end up with its own real Skarloc loot or be empty).
+local _cotHillsbradLoot = {[22927]=1,[24173]=1,[27424]=1,[27426]=1,[27427]=1,[27428]=1,[27430]=1,[27431]=1,[27432]=1,[27433]=1,
+    [27434]=1,[27440]=1,[27904]=1,[27911]=1,[28191]=1,[28216]=1,[28217]=1,[28218]=1,[28219]=1,[28220]=1,
+    [28221]=1,[28222]=1,[28223]=1,[28224]=1,[28225]=1,[28226]=1,[28227]=1,[28233]=1,[28344]=1,[28401]=1,
+    [29246]=1,[29250]=1,[29357]=1,[29434]=1,[30534]=1,[30536]=1,[30589]=1,[30590]=1,[30591]=1,[33847]=1,}
+
 LootTracker_Bosses[17862] = {
   name = "Skarloc",
   instance = "(tbc content)",
   expansion = "tbc",
-  loot = {[22927]=1,[24173]=1,[27424]=1,[27426]=1,[27427]=1,[27428]=1,[27430]=1,[27431]=1,[27432]=1,[27433]=1,
-    [27434]=1,[27440]=1,[27904]=1,[27911]=1,[28191]=1,[28216]=1,[28217]=1,[28218]=1,[28219]=1,[28220]=1,
-    [28221]=1,[28222]=1,[28223]=1,[28224]=1,[28225]=1,[28226]=1,[28227]=1,[28233]=1,[28344]=1,[28401]=1,
-    [29246]=1,[29250]=1,[29357]=1,[29434]=1,[30534]=1,[30536]=1,[30589]=1,[30590]=1,[30591]=1,[33847]=1,},
+  loot = _cotHillsbradLoot,
+}
+
+LootTracker_Bosses[18096] = {
+  name = "Epoch Hunter",
+  instance = "Old Hillsbrad Foothills",
+  expansion = "tbc",
+  loot = _cotHillsbradLoot,
 }
 
 LootTracker_Bosses[17879] = {

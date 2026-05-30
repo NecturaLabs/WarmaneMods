@@ -816,12 +816,22 @@ end
 --   2. NPC GUID NOT in LootTracker_Bosses       → key = "trash:" .. session.id;
 --                                                 routes to the single per-
 --                                                 session Trash entry.
---   3. Missing GUID (private-server quirk) or
---      non-NPC GUID (GameObject: chest, herb,
---      ore, fishing node)                       → fall through to legacy
+--   3a. Non-NPC GUID present (GameObject:
+--       chest/herb/ore/fishing node, or an
+--       inventory container like a Dungeon
+--       Finder satchel / Frozen Orb bag)        → key = "container:" .. sourceGuid;
+--                                                 synthetic Chest bucket. We
+--                                                 deliberately do NOT fall
+--                                                 through to lastBossKill
+--                                                 here — that mis-attributed
+--                                                 lootbag drops to the last
+--                                                 boss killed (e.g. Frozen Orb
+--                                                 bag in Ramparts → Kargath).
+--   3b. Missing/empty GUID
+--      (private-server quirk)                   → fall through to legacy
 --                                                 target / candidate /
 --                                                 lastBossKill / synthetic
---                                                 "Chest" chain (preserved).
+--                                                 "Chest" chain.
 function LT:OnLootOpened()
     if not self.currentSession then return end
     local session = self.currentSession
@@ -886,6 +896,11 @@ function LT:OnLootOpened()
         end
 
         if not guid then
+            -- Synthetic-counter form (e.g. "container:5") — used only by the
+            -- legacy fallback when no source GUID was available. The per-slot
+            -- branch above uses "container:" .. sourceGuid (always 0x-prefixed
+            -- hex), so the two forms share the "container:" prefix without
+            -- colliding. Treat both as opaque keys.
             nextSyntheticGuid = nextSyntheticGuid + 1
             guid = "container:" .. nextSyntheticGuid
             name = "Chest"
@@ -950,32 +965,53 @@ function LT:OnLootOpened()
                         end
                     end
                 else
-                    -- GameObject GUID (chest, herb, ore, fishing) — use legacy chain.
-                    -- If the legacy chain's resolved guid collides with a bucket
-                    -- already created by an earlier slot's per-slot path (e.g.
-                    -- both ended up at trashKey), reuse the existing bucket so
-                    -- its items aren't overwritten.
-                    local lb = getLegacyBucket()
-                    bucketKey = lb.guid
-                    bucketRec = buckets[bucketKey] or lb
-                    buckets[bucketKey] = bucketRec
+                    -- Non-NPC sourceGuid: GameObject (chest, herb, ore, fishing)
+                    -- OR an inventory container (Dungeon Finder satchel, Frozen
+                    -- Orb bag, etc.). We have a real source GUID and we know
+                    -- it's not a corpse — falling back to the lastBossKill /
+                    -- candidate heuristic here would mis-attribute lootbag
+                    -- drops to the last boss killed (e.g. a Frozen Orb bag
+                    -- opened in Ramparts → Kargath). Route directly to a
+                    -- synthetic Chest bucket keyed by this source GUID so all
+                    -- slots from the same source aggregate together.
+                    bucketKey = "container:" .. sourceGuid
+                    bucketRec = buckets[bucketKey]
+                    if not bucketRec then
+                        bucketRec = {
+                            guid  = bucketKey,
+                            npcId = nil,
+                            name  = "Chest",
+                            items = {},
+                        }
+                        buckets[bucketKey] = bucketRec
+                    end
                 end
             else
-                -- GetLootSourceInfo missing or empty — use legacy chain.
-                -- Same collision guard as the GameObject branch above.
+                -- GetLootSourceInfo missing or empty — fall back to legacy
+                -- chain (target / candidate / lastBossKill / synthetic Chest).
+                -- The `buckets[bucketKey] or lb` guards the case where multiple
+                -- legacy-fallback slots in the same loot window resolve to the
+                -- same guid (e.g. all to trashKey) so the lazily-built bucket
+                -- isn't overwritten on subsequent slots.
                 local lb = getLegacyBucket()
                 bucketKey = lb.guid
                 bucketRec = buckets[bucketKey] or lb
                 buckets[bucketKey] = bucketRec
             end
 
-            -- Skip currencies and materials at the snapshot layer too. The
-            -- classification gate in OnLootReceived returns before claiming
-            -- from the snapshot, so leaving these in the bucket would just
-            -- sit there until the 30s grace expires. Materials with a cold
-            -- GetItemInfo cache leak through harmlessly — they're already
-            -- handled by the gate on OnLootReceived's side.
-            if not IsCurrency(id) and not IsMaterial(link) then
+            -- Skip currencies, materials, and sub-rare drops at the snapshot
+            -- layer too. The classification gates in OnLootReceived return
+            -- before claiming from the snapshot, so leaving these in the
+            -- bucket would just sit there until the 30s grace expires —
+            -- and worse, a bucket holding one rare + one green would stay
+            -- alive (because items still has entries) past the rare claim.
+            -- Materials with a cold GetItemInfo cache leak through harmlessly
+            -- — they're already handled by the gate on OnLootReceived's side.
+            local q = GetItemQualityFromLink(link)
+            if not IsCurrency(id)
+                and not IsMaterial(link)
+                and not (q and q < 3)
+            then
                 bucketRec.items[id] = (bucketRec.items[id] or 0) + 1
             end
         end
@@ -1043,23 +1079,21 @@ local function ClaimLootSessionByItem(itemId)
 end
 
 -- Synthesize a 100-Need roll for the recipient when no real rolls reached
--- the item. Two scenarios both need this:
---   1. Solo play: there is no group, so no group-loot roll fires; without
---      this, every solo drop renders as "no rolls yet".
---   2. Master loot: the loot master assigns directly, often with no rolls
---      in chat at all. The recipient is the de-facto winner; surface that
---      as a clean 100 Need entry so the UI is consistent with group-loot
---      drops.
--- In both cases, if any real rolls already populated item.rolls (e.g. raid
--- did /random before the ML assigned), we leave them alone — the synthetic
--- only fires for genuinely roll-less drops.
+-- the item. Three scenarios:
+--   1. Solo play: no group, no rolls — every drop would otherwise render
+--      as "no rolls yet".
+--   2. Master loot: the loot master assigns directly, no rolls in chat.
+--      The recipient is the de-facto winner.
+--   3. Group-loot auto-distribution (Wintergrasp / Vault of Archavon /
+--      class-restricted PvP gear): only one player is eligible based on
+--      class/spec, the server skips START_LOOT_ROLL entirely and just
+--      delivers the item. Logs show "X receives loot" with no preceding
+--      roll or won messages. Gated to recipient == local player so non-
+--      looter clients don't fabricate rolls for items they have no
+--      visibility into (e.g. cross-class rolls they weren't eligible for).
 --
--- Known limitation (shared with the FillRecipientOrIncrement note in the
--- activeGroupRolls short-circuit): when the SAME itemId drops twice from
--- one boss, FindItemInBoss reuses the existing entry. The first recipient's
--- synthetic 100 Need stays; the second drop's recipient is not surfaced
--- because #item.rolls > 0 guards re-entry. Acceptable per the project's
--- simpler-over-comprehensive stance.
+-- If any real rolls already populated item.rolls, we leave them alone —
+-- the synthetic only fires for genuinely roll-less drops.
 local function MaybeAddSyntheticRoll(self, item, recipient)
     if not recipient then return end
     item.rolls = item.rolls or {}
@@ -1067,12 +1101,13 @@ local function MaybeAddSyntheticRoll(self, item, recipient)
 
     local isMasterLoot = GetLootMethod and GetLootMethod() == "master"
     if not isMasterLoot then
-        -- Solo gate: only fire if we're truly solo. Master-loot path
-        -- doesn't need this gate.
+        -- Non-master gate: recipient must be the local player. This covers
+        -- solo (always passes) and group-loot auto-distribution where the
+        -- player got an item with no rolls fired. Skips the case where a
+        -- non-looter sees "X receives loot" for items they weren't eligible
+        -- for — those genuinely had no roll messages broadcast to this
+        -- client, but the rolls did happen; faking 100 Need would be wrong.
         if recipient ~= UnitName("player") then return end
-        local nR = (GetNumRaidMembers and GetNumRaidMembers()) or 0
-        local nP = (GetNumPartyMembers and GetNumPartyMembers()) or 0
-        if nR > 0 or nP > 0 then return end
     end
 
     item.rolledBy = item.rolledBy or {}
@@ -1120,28 +1155,22 @@ function LT:OnLootReceived(recipient, itemLink, count)
     end
 
     -- Short-circuit: if START_LOOT_ROLL recently created an item entry for
-    -- this itemId (active rollID context), reuse it. This prevents the
-    -- fallback below from creating a duplicate entry on lastBossKill when
-    -- the item was already attributed to a different boss by OnStartLootRoll
-    -- (common for non-DB bosses on private servers where the DB walk below
-    -- would also fail to find a match). Skips both primary and fallback.
+    -- this itemId (active rollID context), reuse it. Runs BEFORE the sub-rare
+    -- gate so per-drop ctx-bound entries are honored for both rare+ AND
+    -- sub-rare rolled drops — without this ordering, the sub-rare gate's
+    -- FindItemInBoss would find the first matching entry on a second drop,
+    -- filling the wrong entry's recipient and leaving the new per-drop entry
+    -- (created by OnStartLootRoll) with no recipient.
     local ctxID, ctx = FindGroupRollContext(self, itemId)
     if ctx then
         local boss = ctx.session.bosses[ctx.bossIndex]
         local item = boss and boss.items[ctx.itemIndex]
         if item then
-            -- If recipient was already set by OnGroupLootWon (fires just
-            -- before this loot-received message), DON'T re-run Fill — it
-            -- would take the increment branch and double-count a single
-            -- drop. OnGroupLootWon doesn't track count, so leave whatever
-            -- OnStartLootRoll set (which came from GetLootRollItemInfo).
-            --
-            -- Known limitation: when the SAME itemId drops twice from one
-            -- boss in quick succession, FindItemInBoss in OnStartLootRoll
-            -- reuses the existing entry, and OnGroupLootWon's "if not
-            -- item.recipient" guard refuses to overwrite. The second drop's
-            -- winner and count are silently lost. Acceptable per the
-            -- project's "simpler over comprehensive" stance.
+            -- Each OnStartLootRoll creates a fresh entry, so item.recipient
+            -- is nil here and FillRecipientOrIncrement takes the "set" branch.
+            -- The defensive guard remains in case a previous drop's ctx was
+            -- somehow re-bound (shouldn't happen with per-drop entries, but
+            -- cheap insurance).
             if not item.recipient then
                 FillRecipientOrIncrement(item, recipient, count)
             end
@@ -1157,10 +1186,106 @@ function LT:OnLootReceived(recipient, itemLink, count)
         end
     end
 
-    -- Primary attribution: walk currentSession.bosses newest-first and pick
-    -- the first whose DB loot set contains this item. This is deterministic
-    -- and unaffected by LOOT_OPENED timing — items can ONLY be attributed
-    -- to a boss whose static loot table actually contains them.
+    -- Sub-rare drops (uncommon greens) route to the per-session Trash bucket.
+    -- Bosses tab is rare+ only — without this gate, a green BoE listed in a
+    -- DB-known boss's loot table would attribute to the boss via the DB walk
+    -- below. Runs AFTER currency/material classification and the ctx short-
+    -- circuit — anything reaching here is a non-rolled sub-rare (solo autoloot,
+    -- master-loot direct assignment, or addon-loaded-mid-receive).
+    if quality and quality < 3 then
+        local trash = GetOrCreateTrashBoss(self.currentSession)
+        if not trash then return end
+        local _, existing = FindItemInBoss(trash, itemId)
+        if existing then
+            FillRecipientOrIncrement(existing, recipient, count)
+        else
+            existing = {
+                itemId    = itemId,
+                itemLink  = itemLink,
+                recipient = recipient,
+                count     = count or 1,
+                quality   = quality,
+                droppedAt = Now(),
+                rolls     = {},
+            }
+            table.insert(trash.items, existing)
+        end
+        MaybeAddSyntheticRoll(self, existing, recipient)
+        self:Fire("ItemReceived", self.currentSession, trash, existing)
+        return
+    end
+
+    -- Snapshot-first attribution: GetLootSourceInfo gave OnLootOpened a
+    -- definitive source GUID. If a fresh snapshot bucketed this item under
+    -- a specific source (registered DB boss or Trash sentinel), use that —
+    -- it's direct observation and wins over the DB walk, which can wrongly
+    -- attribute when the DB lists the item under a different boss than
+    -- the one that actually dropped it (e.g. Mantle of Perenolde drops
+    -- from Epoch Hunter in Durnholde but is listed in Skarloc's DB loot).
+    -- Symmetric with OnStartLootRoll's snapshot-first step. Container/Chest
+    -- sources fall through here and are handled by the snapshot-fallback
+    -- block below, which lazy-registers them as Chest entries.
+    local snapBoss
+    do
+        local now = Now()
+        for i = 1, #LT.lootSessions do
+            local s = LT.lootSessions[i]
+            if now - s.time <= LOOT_SESSION_GRACE_SECONDS
+                and (s.items[itemId] or 0) > 0
+            then
+                local bIdx, b = FindBossByGuid(self.currentSession, s.guid)
+                if b then
+                    snapBoss = b
+                    -- Promote lastBossKill (see the symmetric note in
+                    -- OnStartLootRoll's snapshot-first block).
+                    self.lastBossKill = {
+                        session   = self.currentSession,
+                        bossIndex = bIdx,
+                        time      = b.killedAt,
+                        guid      = b.guid,
+                    }
+                elseif s.guid == "trash:" .. tostring(self.currentSession.id) then
+                    snapBoss = GetOrCreateTrashBoss(self.currentSession)
+                    -- Don't promote lastBossKill for Trash.
+                end
+                if snapBoss then
+                    -- Decrement / evict per ClaimLootSessionByItem semantics.
+                    s.items[itemId] = s.items[itemId] - 1
+                    if s.items[itemId] == 0 then
+                        s.items[itemId] = nil
+                        if not next(s.items) then
+                            table.remove(LT.lootSessions, i)
+                        end
+                    end
+                    break
+                end
+            end
+        end
+    end
+    if snapBoss then
+        local _, existing = FindItemInBoss(snapBoss, itemId)
+        if existing then
+            FillRecipientOrIncrement(existing, recipient, count)
+        else
+            existing = {
+                itemId    = itemId,
+                itemLink  = itemLink,
+                recipient = recipient,
+                count     = count or 1,
+                quality   = quality,
+                droppedAt = Now(),
+                rolls     = {},
+            }
+            table.insert(snapBoss.items, existing)
+        end
+        MaybeAddSyntheticRoll(self, existing, recipient)
+        self:Fire("ItemReceived", self.currentSession, snapBoss, existing)
+        return
+    end
+
+    -- DB walk: registered boss whose DB loot set contains this item, walked
+    -- newest-first. Used when snapshot doesn't have the item (snapshot
+    -- expired, non-looter without a LOOT_OPENED event, etc.).
     if LootTracker_Bosses then
         local bosses = self.currentSession.bosses
         for i = #bosses, 1, -1 do
@@ -1317,50 +1442,142 @@ function LT:OnStartLootRoll(rollID, duration)
     local _, _, count, quality = GetLootRollItemInfo(rollID)
     if not quality or quality < 2 then return end
 
-    -- Prefer a registered boss whose DB loot table contains this item, walked
-    -- newest-first. Mirrors OnLootReceived's primary path so START_LOOT_ROLL
-    -- and OnLootReceived attribute the same item to the same boss — without
-    -- this, EnsureBossContext could attach to lastBossKill while OnLootReceived
-    -- later picks a different (correct, DB-matched) boss, producing a duplicate
-    -- entry and orphaning the rolls onto the wrong copy.
     local session = self.currentSession
     local boss, bossIndex
-    if LootTracker_Bosses then
-        local bosses = session.bosses
-        for i = #bosses, 1, -1 do
-            local b = bosses[i]
-            local dbEntry = b.npcId and LootTracker_Bosses[b.npcId]
-            if dbEntry and dbEntry.loot and dbEntry.loot[itemId] then
-                boss = b
-                bossIndex = i
-                break
+
+    -- Sub-rare items route to the per-session Trash bucket so subsequent
+    -- roll messages and won announcements (which look up via this rollID's
+    -- ctx) attribute to a Trash item entry rather than creating a green on
+    -- the boss. Bosses tab is rare+ only; keeps START_LOOT_ROLL aligned with
+    -- OnLootReceived's quality gate.
+    if quality < 3 then
+        boss = GetOrCreateTrashBoss(session)
+        if boss then
+            -- Trash is keyed by a deterministic guid, so FindBossByGuid is
+            -- both self-documenting and avoids a reverse linear scan over
+            -- a long raid's boss list every sub-rare roll. The `or` fallback
+            -- makes the post-insert invariant explicit: GetOrCreateTrashBoss
+            -- just inserted at the end (or found the existing entry), so the
+            -- lookup can't legitimately miss — but if it ever did, bossIndex
+            -- would be nil and downstream session.bosses[nil] indirection
+            -- would silently swallow the rollID context.
+            bossIndex = FindBossByGuid(session, "trash:" .. tostring(session.id))
+                or #session.bosses
+        end
+    else
+        -- Step 1 (snapshot-first): GetLootSourceInfo gave OnLootOpened a
+        -- definitive source GUID per slot. If a recent snapshot bucketed
+        -- this item under a specific source (a registered DB boss, the
+        -- per-session Trash bucket, or a Chest container) USE IT — that's
+        -- direct observation, not a heuristic. This wins over the DB walk
+        -- below, which can wrongly attribute items to the wrong boss when
+        -- the DB lists the same item under multiple bosses or when the DB
+        -- is simply wrong (e.g., Mantle of Perenolde / Diamond Prism of
+        -- Recurrence are listed under Skarloc but drop from Epoch Hunter
+        -- in Durnholde; the DB walk would pick Skarloc as lastBossKill
+        -- even though the actual corpse was Epoch Hunter).
+        local now = Now()
+        for i = 1, #LT.lootSessions do
+            local s = LT.lootSessions[i]
+            if now - s.time <= LOOT_SESSION_GRACE_SECONDS
+                and (s.items[itemId] or 0) > 0
+            then
+                local bIdx, b = FindBossByGuid(session, s.guid)
+                if b then
+                    boss = b
+                    bossIndex = bIdx
+                    -- Promote lastBossKill so any subsequent event that
+                    -- consults it (EnsureBossContext step 2/5, OnGroupLoot-
+                    -- Roll's fallback, OnLootReceived's later branches when
+                    -- snapshot has expired) anchors to the snapshot's actual
+                    -- source rather than a stale prior kill. Mirrors
+                    -- EnsureBossContext step 1's lastBossKill promotion.
+                    self.lastBossKill = {
+                        session   = session,
+                        bossIndex = bIdx,
+                        time      = b.killedAt,
+                        guid      = b.guid,
+                    }
+                elseif s.guid == "trash:" .. tostring(session.id) then
+                    boss = GetOrCreateTrashBoss(session)
+                    bossIndex = FindBossByGuid(session,
+                        "trash:" .. tostring(session.id))
+                        or #session.bosses
+                    -- Don't promote lastBossKill for Trash — it isn't a
+                    -- "kill" and promoting it would mask a real prior boss
+                    -- the rest of the heuristic chain still needs.
+                end
+                -- Container/Chest sources (no FindBossByGuid match and not
+                -- the trash sentinel) fall through to DB walk + EnsureBoss-
+                -- Context; the snapshot-fallback path in OnLootReceived
+                -- lazy-registers them as Chest entries when the item is
+                -- actually received.
+                if boss then
+                    -- Decrement the snapshot's slot count and evict the
+                    -- bucket when fully claimed. Matches ClaimLootSession-
+                    -- ByItem's semantics so two overlapping snapshots
+                    -- sharing the same itemId (boss A drops X then boss B
+                    -- drops X within 30s grace) don't both route every
+                    -- drop of X to whichever snapshot was iterated first.
+                    s.items[itemId] = s.items[itemId] - 1
+                    if s.items[itemId] == 0 then
+                        s.items[itemId] = nil
+                        if not next(s.items) then
+                            table.remove(LT.lootSessions, i)
+                        end
+                    end
+                    break
+                end
             end
+        end
+
+        -- Step 2 (DB walk): registered boss whose DB loot table contains
+        -- this item, walked newest-first. Used when snapshot doesn't have
+        -- the item (snapshot expired, addon loaded mid-roll, non-looter
+        -- with no LOOT_OPENED event). Mirrors OnLootReceived's primary
+        -- path so START_LOOT_ROLL and OnLootReceived attribute the same
+        -- item to the same boss when the snapshot path is unavailable.
+        if not boss and LootTracker_Bosses then
+            local bosses = session.bosses
+            for i = #bosses, 1, -1 do
+                local b = bosses[i]
+                local dbEntry = b.npcId and LootTracker_Bosses[b.npcId]
+                if dbEntry and dbEntry.loot and dbEntry.loot[itemId] then
+                    boss = b
+                    bossIndex = i
+                    break
+                end
+            end
+        end
+
+        -- Step 3 (heuristic fallback): items not in any registered boss's
+        -- DB loot (non-DB encounters, custom server items, holiday loot).
+        if not boss then
+            if not EnsureBossContext(self, itemId) then return end
+            bossIndex = self.lastBossKill.bossIndex
+            boss = session.bosses[bossIndex]
         end
     end
 
-    -- Fallback to the existing heuristic for items not in any registered
-    -- boss's DB loot (non-DB encounters, custom server items, holiday loot).
-    if not boss then
-        if not EnsureBossContext(self, itemId) then return end
-        bossIndex = self.lastBossKill.bossIndex
-        boss = session.bosses[bossIndex]
-        if not boss then return end
-    end
+    if not boss then return end
 
-    local itemIndex, item = FindItemInBoss(boss, itemId)
-    if not item then
-        item = {
-            itemId    = itemId,
-            itemLink  = itemLink,
-            count     = count or 1,
-            quality   = quality,
-            droppedAt = Now(),
-            rolls     = {},
-        }
-        table.insert(boss.items, item)
-        itemIndex = #boss.items
-        self:Fire("ItemReceived", session, boss, item)
-    end
+    -- Always create a fresh entry per rollID — never reuse an existing entry
+    -- via FindItemInBoss. The same itemId can drop multiple times from the
+    -- same boss; reusing would collapse all drops into one entry and the
+    -- rolledBy guard in OnGroupLootRoll would silently drop every roll from
+    -- a player who already rolled on a prior drop. Each rollID gets its own
+    -- rolls list, recipient, and trade-window timer.
+    local item = {
+        itemId    = itemId,
+        itemLink  = itemLink,
+        count     = count or 1,
+        quality   = quality,
+        droppedAt = Now(),
+        rolls     = {},
+    }
+    table.insert(boss.items, item)
+    local itemIndex = #boss.items
+    self:Fire("ItemReceived", session, boss, item)
 
     -- WoW 3.3.5 passes `duration` in milliseconds.
     local durSec = (duration or 90000) / 1000
@@ -1433,12 +1650,13 @@ function LT:OnGroupLootRoll(playerName, value, itemLink, rollType)
 
     -- Fast path: START_LOOT_ROLL gave us an exact rollID→boss/item context.
     -- This bypasses EnsureBossContext entirely for the common case. It is NOT
-    -- fully deterministic when two bosses drop the same item with overlapping
-    -- roll windows — CHAT_MSG_LOOT carries no rollID, so all roll messages
-    -- for that itemId route to the most-recently-started context (the older
-    -- boss's rolls misattribute to the newer one). This is an inherent limit
-    -- of the chat surface; the pre-existing EnsureBossContext heuristic had
-    -- the same/worse problem (everything pinned to lastBossKill).
+    -- fully deterministic when two contexts share the same itemId with
+    -- overlapping roll windows — CHAT_MSG_LOOT carries no rollID, so all roll
+    -- messages for that itemId route to the most-recently-started context.
+    -- This happens for (a) two bosses dropping the same item, and (b) a
+    -- single boss dropping the same itemId twice with overlapping windows
+    -- (per-drop entries from OnStartLootRoll): drop 1's late roll messages
+    -- route to drop 2's entry. Inherent limit of the chat surface.
     local ctxID, ctx = FindGroupRollContext(self, itemId)
     if ctx then
         session = ctx.session
@@ -1456,10 +1674,21 @@ function LT:OnGroupLootRoll(playerName, value, itemLink, rollType)
     -- addon loaded mid-roll, the event was missed, or for "X passed on:"
     -- messages whose roll context was already pruned.
     if not item then
-        if not EnsureBossContext(self, itemId) then return end
-        session = self.lastBossKill.session
-        boss = session.bosses[self.lastBossKill.bossIndex]
-        if not boss then return end
+        if rollQuality and rollQuality < 3 then
+            -- Sub-rare → Trash (Bosses tab is rare+ only). Third leg of
+            -- the same gate that runs in OnLootReceived and OnStartLootRoll
+            -- — covers the case where this is the first roll message we
+            -- ever see for this item (addon loaded mid-roll, or a "passed
+            -- on" message whose START_LOOT_ROLL context was already pruned).
+            session = self.currentSession
+            boss = GetOrCreateTrashBoss(session)
+            if not boss then return end
+        else
+            if not EnsureBossContext(self, itemId) then return end
+            session = self.lastBossKill.session
+            boss = session.bosses[self.lastBossKill.bossIndex]
+            if not boss then return end
+        end
 
         local _, existing = FindItemInBoss(boss, itemId)
         if not existing then
@@ -1483,23 +1712,27 @@ function LT:OnGroupLootRoll(playerName, value, itemLink, rollType)
     end
 
     if item.rolledBy[playerName] then
-        -- Existing entry. Upgrade a "has selected" intent (value=nil) when
-        -- the corresponding numeric roll value arrives. Don't downgrade a
-        -- numeric value back to nil, and don't overwrite an already-numeric
-        -- value (the first broadcast wins on the rare case of duplicates).
-        if value ~= nil then
-            for _, r in ipairs(item.rolls) do
-                if r.player == playerName then
-                    if r.value == nil then
-                        r.value = value
-                        r.rollType = rollType
-                        r.time = Now()
-                        table.sort(item.rolls,
-                            function(a, b) return (a.value or 0) > (b.value or 0) end)
-                        self:Fire("RollAdded", session, boss, item)
-                    end
-                    return
+        -- Existing entry. Allowed transitions while no numeric value has
+        -- landed yet (r.value == nil):
+        --   * Intent → other intent (Need → Greed, Greed → Need, etc.)
+        --   * Intent → Pass (player changed their mind before rolling)
+        --   * Pass → intent (rare but harmless; e.g., re-opened loot dialog)
+        --   * Intent → numeric (the normal roll-resolution upgrade)
+        -- Once r.value is numeric, it's locked: don't downgrade to nil, and
+        -- don't overwrite with a second numeric (first broadcast wins on the
+        -- rare case of duplicates).
+        for _, r in ipairs(item.rolls) do
+            if r.player == playerName then
+                if r.value ~= nil then return end  -- locked
+                r.value    = value
+                r.rollType = rollType
+                r.time     = Now()
+                if value ~= nil then
+                    table.sort(item.rolls,
+                        function(a, b) return (a.value or 0) > (b.value or 0) end)
                 end
+                self:Fire("RollAdded", session, boss, item)
+                return
             end
         end
         return
