@@ -33,10 +33,14 @@ LT.lastBossKill     = nil   -- { session, bossIndex, time, guid }
 LT.candidateDeaths  = {}    -- recent unattributed NPC deaths
 LT.lootSessions     = {}    -- queue of { guid, npcId, name, time, items } from recent LOOT_OPENED snapshots
 LT.activeGroupRolls   = {}  -- [rollID] = { session, bossIndex, itemIndex, itemId, itemLink, startedAt, expiresAt }
+LT.manualRoll         = nil  -- master-loot: { itemId, itemLink, expiresAt } — item currently being /roll'd on
 LT.resetInstanceNames = {}  -- [instanceName:lower()] = true; consumed on the next entry into that instance
 LT.listeners          = {}
 
 local GROUP_ROLL_GRACE_SECONDS = 30  -- keep rollID entries around this long after CANCEL for late chat
+-- Master-loot manual rolls: how long an /rw-announced item collects /roll
+-- results before the window expires (a fresh announcement also supersedes it).
+local MANUAL_ROLL_WINDOW_SECONDS = 120
 
 -- Forward declaration: FindGroupRollContext is defined later (in the group-loot
 -- section) but is also called by OnLootReceived (defined earlier in the file).
@@ -66,6 +70,7 @@ local function ClearTransientState(self)
     self.candidateDeaths  = {}
     self.lootSessions     = {}
     self.activeGroupRolls = {}
+    self.manualRoll       = nil
 end
 
 -- WoW link color hex -> item quality
@@ -109,6 +114,12 @@ local WON_SELF           = BuildPattern(LOOT_ROLL_YOU_WON        or "You won: %s
 local WON_OTHER          = BuildPattern(LOOT_ROLL_WON            or "%s won: %s.")
 local WON_NOBODY         = BuildPattern(LOOT_ROLL_ALL_PASSED     or "Everyone passed on: %s")
 local INSTANCE_RESET     = BuildPattern(INSTANCE_RESET_SUCCESS   or "%s has been reset.")
+-- Master-loot manual rolls: the loot master raid-warns an item, players /roll,
+-- and the server broadcasts RANDOM_ROLL_RESULT ("%s rolls %d (%d-%d)") via
+-- CHAT_MSG_SYSTEM. Unlike the group-loot roll messages above, this carries NO
+-- item link — the roll is anchored to the most recently announced item (see
+-- OnManualRollAnnounce). Captures: (name, value, minRoll, maxRoll).
+local RANDOM_ROLL        = BuildPattern(RANDOM_ROLL_RESULT       or "%s rolls %d (%d-%d)")
 
 local ITEM_LINK_FULL    = "(|c%x+|Hitem:%d+:.-|h%[.-%]|h|r)"
 
@@ -1183,6 +1194,16 @@ function LT:OnLootReceived(recipient, itemLink, count)
     if not self.currentSession then return end
     local itemId = GetItemIDFromLink(itemLink)
     if not itemId then return end
+
+    -- Master-loot manual rolls: assignment of the announced item ends its
+    -- roll. Close the window now so a later unrelated /roll within the 120s
+    -- timeout can't be mis-recorded as a Need roll on an already-resolved
+    -- item. The item's existing roll entry (built during the rolling phase)
+    -- and recipient fill-in below are unaffected.
+    if self.manualRoll and self.manualRoll.itemId == itemId then
+        self.manualRoll = nil
+    end
+
     local quality = GetItemQualityFromLink(itemLink)
     -- Drop grey/white drops entirely — the addon tracks rolled loot, and
     -- vendor trash would just pollute the items list and force extra UI
@@ -1820,6 +1841,52 @@ function LT:OnGroupLootRoll(playerName, value, itemLink, rollType)
     self:Fire("RollAdded", session, boss, item)
 end
 
+-- ---------------------------------------------------------------------------
+-- Master-loot manual rolls
+-- ---------------------------------------------------------------------------
+--
+-- Under master loot the automatic group-loot roll system is disabled: there is
+-- no START_LOOT_ROLL and no "X rolled N for [Item]" CHAT_MSG_LOOT messages.
+-- Instead the loot master raid-warns an item ("/rw [Item] roll") and players
+-- type /roll, which the server broadcasts as a link-less RANDOM_ROLL_RESULT
+-- system message. We anchor those rolls to the most recently announced item.
+
+-- Open (or replace) the manual-roll window from a raid-warning item link.
+-- Gated to master loot so normal group-loot raids — where the automatic system
+-- already tracks rolls — don't spawn phantom windows from incidental item
+-- links in a warning. Only the FIRST link in the warning is used (one active
+-- roll at a time); a later announcement supersedes the current window.
+function LT:OnManualRollAnnounce(itemLink)
+    if not self.currentSession then return end
+    if not (GetLootMethod and GetLootMethod() == "master") then return end
+    local itemId = GetItemIDFromLink(itemLink)
+    if not itemId then return end
+    self.manualRoll = {
+        itemId    = itemId,
+        itemLink  = itemLink,
+        expiresAt = Now() + MANUAL_ROLL_WINDOW_SECONDS,
+    }
+end
+
+-- Attach a manual /roll result to the active roll window. Only standard 1-100
+-- rolls count — off-spec (/roll 1-50) and tiebreak (/roll 101-200) ranges are
+-- ignored so they don't pollute the main roll list. Delegates to OnGroupLootRoll
+-- with the announced item link so all boss-resolution, dedup, and sort logic is
+-- shared; rollType "Need" is what a master-loot roll effectively is (and renders
+-- as the dice icon). The 3.3.5 RANDOM_ROLL_RESULT message uses the roller's real
+-- name even for the local player, so no "You" remap is needed here.
+function LT:OnManualRoll(playerName, value, minRoll, maxRoll)
+    local mr = self.manualRoll
+    if not mr then return end
+    if Now() > mr.expiresAt then
+        self.manualRoll = nil
+        return
+    end
+    if not (playerName and value) then return end
+    if minRoll ~= 1 or maxRoll ~= 100 then return end
+    self:OnGroupLootRoll(playerName, value, mr.itemLink, "Need")
+end
+
 -- Fires when CHAT_MSG_LOOT emits "You won: [Item]" or "<Player> won: [Item]"
 -- at the end of a group-loot roll. Only the looter sees their own OnLootReceived
 -- for the item — for everyone else, this is the only signal of who got it. Sets
@@ -2408,6 +2475,7 @@ eventFrame:RegisterEvent("START_LOOT_ROLL")
 eventFrame:RegisterEvent("CANCEL_LOOT_ROLL")
 eventFrame:RegisterEvent("CHAT_MSG_LOOT")
 eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
+eventFrame:RegisterEvent("CHAT_MSG_RAID_WARNING")
 eventFrame:RegisterEvent("PARTY_MEMBERS_CHANGED")
 eventFrame:RegisterEvent("RAID_ROSTER_UPDATE")
 eventFrame:RegisterEvent("INSPECT_TALENT_READY")
@@ -2483,18 +2551,36 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
                 end
             end
         end
-    elseif event == "CHAT_MSG_SYSTEM" then
-        -- "<Instance> has been reset." — flag the instance so the next
-        -- OnZoneChanged into it starts a fresh session instead of rejoining
-        -- the recent one via FindRecentMatchingSession. Assumes the system
-        -- message's instance name matches GetInstanceInfo()'s value
-        -- case-insensitively (true for enUS WotLK 3.3.5; some private
-        -- servers append difficulty suffixes like " (10)" which would
-        -- break the match — out of scope per the addon's enUS policy).
+    elseif event == "CHAT_MSG_RAID_WARNING" then
+        -- Master-loot manual rolls: the loot master raid-warns an item
+        -- ("/rw [Item] roll"). The first item link in the warning opens a
+        -- roll window that subsequent /roll system messages attach to.
         local text = ...
-        local resetName = text:match(INSTANCE_RESET)
-        if resetName then
-            LT.resetInstanceNames[resetName:lower()] = true
+        local link = text and text:match(ITEM_LINK_FULL)
+        if link then
+            LT:OnManualRollAnnounce(link)
+        end
+    elseif event == "CHAT_MSG_SYSTEM" then
+        local text = ...
+        -- Master-loot manual roll result: "<Player> rolls <N> (<min>-<max>)".
+        -- Anchored to the item from the most recent raid-warning announcement
+        -- (see OnManualRoll); link-less, so it can't be attributed on its own.
+        local rollerName, rollValue, rollMin, rollMax = text:match(RANDOM_ROLL)
+        if rollerName then
+            LT:OnManualRoll(StripRealm(rollerName), tonumber(rollValue),
+                tonumber(rollMin), tonumber(rollMax))
+        else
+            -- "<Instance> has been reset." — flag the instance so the next
+            -- OnZoneChanged into it starts a fresh session instead of rejoining
+            -- the recent one via FindRecentMatchingSession. Assumes the system
+            -- message's instance name matches GetInstanceInfo()'s value
+            -- case-insensitively (true for enUS WotLK 3.3.5; some private
+            -- servers append difficulty suffixes like " (10)" which would
+            -- break the match — out of scope per the addon's enUS policy).
+            local resetName = text:match(INSTANCE_RESET)
+            if resetName then
+                LT.resetInstanceNames[resetName:lower()] = true
+            end
         end
     end
 end)
