@@ -52,6 +52,20 @@ local function ClassColorString(class)
     return c and c.colorStr or "ffffffff"
 end
 
+-- WoW substitutes "..." for a unit/player name it hasn't resolved yet (a
+-- cross-realm or just-joined raid member, an out-of-range looter — the same
+-- case the roll-row equipped-lookup retry below already accounts for). That
+-- placeholder is captured verbatim from loot/roll chat messages and stored, so
+-- normalize it to a readable label at every name-display site. Doing it on the
+-- display side (rather than at capture) heals already-stored data too, with no
+-- migration. nil/empty get the same treatment.
+local function DisplayName(name)
+    if not name or name == "" or name == "..." then
+        return UNKNOWN or "Unknown"
+    end
+    return name
+end
+
 local function FormatSessionLabel(s)
     return string.format("%s (%s) — %s",
         s.instanceName or "?",
@@ -557,12 +571,13 @@ local function EnsureIconTicker()
         if elapsed < 0.3 then return end
         elapsed = 0
         attempts = attempts + 1
-        local anyPending = false
+        local anyPending, anyResolved = false, false
         for widget, itemId in pairs(iconQueue) do
             local tex = FetchIcon(itemId)
             if tex then
                 widget:SetTexture(tex)
                 iconQueue[widget] = nil
+                anyResolved = true
             else
                 anyPending = true
             end
@@ -575,6 +590,14 @@ local function EnsureIconTicker()
             self:Hide()
             attempts = 0
         end
+        -- An icon resolving means that item's info just landed in the client
+        -- cache, so any aggregate row still showing the "[...]" cold-cache
+        -- placeholder name (see ResolveAggregateLink) can now resolve to the
+        -- real name. Re-render to heal those labels automatically — Refresh
+        -- mutates iconQueue (ReleaseAll clears it, re-render re-queues), so it
+        -- MUST run after the loop above, never mid-iteration. Refresh no-ops
+        -- when the frame is hidden, so this is cheap when nobody's looking.
+        if anyResolved and Refresh then Refresh() end
     end)
 end
 
@@ -926,7 +949,7 @@ local function RenderRollRowAt(roll, width, y, parentItem)
         rr.classIcon:SetTexture(nil)
     end
     rr.nameText:SetText(string.format("|c%s%s|r",
-        ClassColorString(roll.class), roll.player or "?"))
+        ClassColorString(roll.class), DisplayName(roll.player)))
 
     rr.nameText:ClearAllPoints()
     rr.nameText:SetPoint("LEFT", rr.classIcon, "RIGHT", 4, 0)
@@ -975,6 +998,29 @@ local function GetContentWidth()
     return w
 end
 
+-- Resolve the best hyperlink for an aggregated entry. Emblems and other
+-- currencies are routinely looted before their tooltip is ever shown, so the
+-- link captured from the loot message can still carry 3.3.5's cold-cache
+-- placeholder name ("[...]") — which renders as a bare "...". GetItemInfo(itemId)
+-- returns a fully-resolved link once the client has the item cached. SetItemIcon
+-- (called just before this) kicks off that caching via a tooltip scan, but the
+-- fill is asynchronous (the icon ticker exists precisely because it can take a
+-- few frames) — so for a truly cold item GetItemInfo still returns nil this
+-- frame and we fall back to the stored placeholder link for this paint. The
+-- icon ticker re-renders the moment that item's icon (and thus its cached info)
+-- lands, at which point this resolves to the real name and we persist the
+-- upgrade back onto the entry so it sticks for tooltips and all future renders.
+-- Net effect: a cold currency shows the "..." placeholder for at most a fraction
+-- of a second after the tab opens, then heals itself with no user action.
+local function ResolveAggregateLink(entry, itemId)
+    local _, freshLink = GetItemInfo(itemId)
+    if freshLink then
+        entry.itemLink = freshLink
+        return freshLink
+    end
+    return entry.itemLink
+end
+
 -- Render one row per aggregated item in `bucket` (session.currencies or
 -- session.materials). The row reuses the existing item-row pool/widget but
 -- with `row.item = nil`, which makes its OnClick a no-op (no expand/collapse).
@@ -1007,8 +1053,9 @@ local function RenderAggregateTab(bucket, emptyText)
         row:SetWidth(width)
         row:SetPoint("TOPLEFT", 0, -y)
         row.item     = nil
-        row.itemLink = rec.entry.itemLink
         SetItemIcon(row.icon, rec.itemId)
+        local itemLink = ResolveAggregateLink(rec.entry, rec.itemId)
+        row.itemLink = itemLink
         row.expand:Hide()
         row.icon:ClearAllPoints()
         row.icon:SetPoint("LEFT", 4, 0)
@@ -1030,11 +1077,11 @@ local function RenderAggregateTab(bucket, emptyText)
         for i, r in ipairs(rNames) do
             if i > 1 then rText = rText .. ", " end
             local class = LT:GetPlayerClass(r.name)
-            rText = rText .. "|c" .. ClassColorString(class) .. r.name .. "|r x" .. r.count
+            rText = rText .. "|c" .. ClassColorString(class) .. DisplayName(r.name) .. "|r x" .. r.count
         end
         local recipientPart = (rText ~= "") and ("  (" .. rText .. ")") or ""
 
-        local label = (rec.entry.itemLink or "?")
+        local label = (itemLink or "?")
             .. "  |cffaaaaaax" .. rec.entry.count .. "|r"
             .. recipientPart
         row.nameText:SetText(label)

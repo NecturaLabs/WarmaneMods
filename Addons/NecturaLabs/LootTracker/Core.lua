@@ -50,6 +50,12 @@ local FindGroupRollContext
 -- as FindGroupRollContext above.
 local ResolveInferredBoss
 
+-- Forward declaration: EnsureBossRegistered is defined later but called by
+-- EnsureBossContext (defined earlier, in its snapshot-with-npcId branch).
+-- Without this, that reference would bind to a nil global and error the first
+-- time the branch is hit. Same reasoning as ResolveInferredBoss above.
+local EnsureBossRegistered
+
 -- Single source of truth for "wipe everything tied to the current run." Four
 -- sites need this (zone exit, zone re-enter into new session, DeleteSession
 -- of the current one, Reset) and previously each site enumerated the fields
@@ -156,6 +162,14 @@ end
 local function GetItemQualityFromLink(link)
     local color = link and link:match("|cff(%x%x%x%x%x%x)")
     return color and QUALITY_FROM_COLOR[color:lower()]
+end
+
+-- True when this loot recipient is the local player. ParseLoot sets recipient
+-- to UnitName("player") verbatim for "You receive loot:" lines, so this compares
+-- that value to itself — exact, and free of realm-suffix concerns (3.3.5 returns
+-- the bare name). Distinguishes personal loot from group members' loot.
+local function IsLocalPlayer(recipient)
+    return recipient == UnitName("player")
 end
 
 local function FindItemInBoss(boss, itemId)
@@ -498,12 +512,38 @@ local function PopRecentCandidate(window)
     end
 end
 
+-- Point lastBossKill at an already-registered boss entry. OnBossKill is the
+-- only other writer of lastBossKill, but the EnsureBossRegistered /
+-- ResolveInferredBoss paths can hand back an EXISTING entry without going
+-- through it (guid match, or npcId match against a prior inferred/real entry).
+-- Those paths must promote explicitly or lastBossKill silently stays stale —
+-- or nil, when transient state was cleared (zone exit) but the session's boss
+-- list survived — and EnsureBossContext's callers crash indexing it. Returns
+-- true if the boss was found in the current session and promoted.
+local function PromoteBossToLBK(self, boss)
+    local session = self.currentSession
+    if not (session and boss) then return false end
+    for i = #session.bosses, 1, -1 do
+        if session.bosses[i] == boss then
+            self.lastBossKill = {
+                session   = session,
+                bossIndex = i,
+                time      = boss.killedAt,
+                guid      = boss.guid,
+            }
+            return true
+        end
+    end
+    return false
+end
+
 -- Group loot, and master-loot raids where the announcing player isn't the
 -- local one, can fire CHAT_MSG_LOOT roll/announce messages BEFORE the player
 -- has opened any loot window — meaning OnLootOpened (and its DB shortcut)
 -- never ran. Promote the right candidate so the roll/announce has a boss
--- entry to attach to. Returns true if there's a valid boss context after
--- the call, false otherwise.
+-- entry to attach to. Returns true if there's a valid boss context after the
+-- call, false otherwise. On a true return, self.lastBossKill is guaranteed
+-- non-nil and pointing at the resolved boss — callers rely on this.
 --
 -- Disambiguation priority (when itemId is known):
 --   1. a recent LOOT_OPENED snapshot contains this item (direct observation
@@ -550,9 +590,17 @@ local function EnsureBossContext(self, itemId)
                         guid      = existing.guid,
                     }
                 elseif s.npcId then
-                    EnsureBossRegistered(self, s.npcId, s.name, s.time, s.guid)
+                    -- EnsureBossRegistered may return an existing entry without
+                    -- touching lastBossKill; promote it ourselves so the
+                    -- contract (true ⟹ valid lastBossKill) holds.
+                    if not PromoteBossToLBK(self,
+                        EnsureBossRegistered(self, s.npcId, s.name, s.time, s.guid))
+                    then
+                        return false
+                    end
                 else
                     self:OnBossKill(nil, s.name, s.time, s.guid)
+                    if not self.lastBossKill then return false end
                 end
                 return true
             end
@@ -591,7 +639,12 @@ local function EnsureBossContext(self, itemId)
     -- boss B, items from B's group-loot rolls attach to A via step 5"
     -- mis-attribution. Returns nil for items not in any DB loot table,
     -- which falls through to step 5.
-    if ResolveInferredBoss(self, itemId) then return true end
+    -- ResolveInferredBoss returns an existing entry without promoting it (and
+    -- after a zone-exit ClearTransientState, lastBossKill is nil while the
+    -- inferred boss survives) — promote so the true return honors the contract.
+    if PromoteBossToLBK(self, ResolveInferredBoss(self, itemId)) then
+        return true
+    end
 
     -- Step 5: fall back to lastBossKill (best guess for non-DB content
     -- and items missing from the DB loot tables).
@@ -622,7 +675,8 @@ end
 --
 -- Returns the existing or freshly-registered boss entry, or nil if no
 -- session is active.
-local function EnsureBossRegistered(self, npcId, name, killTime, guid)
+-- Assigned (not declared) — see forward declaration near the top of the file.
+EnsureBossRegistered = function(self, npcId, name, killTime, guid)
     if not self.currentSession then return nil end
     local _, existing = FindBossByGuid(self.currentSession, guid)
     if existing then return existing end
@@ -1107,7 +1161,7 @@ local function MaybeAddSyntheticRoll(self, item, recipient)
         -- non-looter sees "X receives loot" for items they weren't eligible
         -- for — those genuinely had no roll messages broadcast to this
         -- client, but the rolls did happen; faking 100 Need would be wrong.
-        if recipient ~= UnitName("player") then return end
+        if not IsLocalPlayer(recipient) then return end
     end
 
     item.rolledBy = item.rolledBy or {}
@@ -1143,14 +1197,27 @@ function LT:OnLootReceived(recipient, itemLink, count)
     -- stays focused on rolled gear. Run BEFORE the rollID/snapshot/DB walks
     -- — those paths assume boss attribution and would otherwise create
     -- placeholder boss entries for emblems / dust / shards.
+    --
+    -- Personal-loot only: the Currencies/Materials tabs track what YOU earned,
+    -- not the whole group's emblem/dust haul. ParseLoot sets recipient to
+    -- UnitName("player") for your own "You receive loot:" line and to the other
+    -- player's name for "X receives loot:", so this comparison cleanly tells the
+    -- two apart. A non-personal currency/material is still classified here (so it
+    -- returns and never reaches the boss-attribution walks below) — it just
+    -- isn't recorded.
+    local isPersonalLoot = IsLocalPlayer(recipient)
     if IsCurrency(itemId) then
-        local entry = RecordCurrency(self.currentSession, itemId, itemLink, recipient, count)
-        self:Fire("CurrencyReceived", self.currentSession, entry)
+        if isPersonalLoot then
+            local entry = RecordCurrency(self.currentSession, itemId, itemLink, recipient, count)
+            self:Fire("CurrencyReceived", self.currentSession, entry)
+        end
         return
     end
     if IsMaterial(itemLink) then
-        local entry = RecordMaterial(self.currentSession, itemId, itemLink, recipient, count)
-        self:Fire("MaterialReceived", self.currentSession, entry)
+        if isPersonalLoot then
+            local entry = RecordMaterial(self.currentSession, itemId, itemLink, recipient, count)
+            self:Fire("MaterialReceived", self.currentSession, entry)
+        end
         return
     end
 
@@ -1554,6 +1621,7 @@ function LT:OnStartLootRoll(rollID, duration)
         -- DB loot (non-DB encounters, custom server items, holiday loot).
         if not boss then
             if not EnsureBossContext(self, itemId) then return end
+            if not self.lastBossKill then return end
             bossIndex = self.lastBossKill.bossIndex
             boss = session.bosses[bossIndex]
         end
@@ -1685,6 +1753,7 @@ function LT:OnGroupLootRoll(playerName, value, itemLink, rollType)
             if not boss then return end
         else
             if not EnsureBossContext(self, itemId) then return end
+            if not self.lastBossKill then return end
             session = self.lastBossKill.session
             boss = session.bosses[self.lastBossKill.bossIndex]
             if not boss then return end
