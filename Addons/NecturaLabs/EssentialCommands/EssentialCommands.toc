@@ -1,0 +1,7 @@
+## Interface: 30300
+## Title: EssentialCommands
+## Notes: Adds /i and /instance to chat to whatever group channel you are in (raid > party > say)
+## Author: Nectura
+## Version: 1.0
+
+EssentialCommands.lua
