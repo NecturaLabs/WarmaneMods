@@ -15,7 +15,7 @@ local LOOT_OPEN_FALLBACK_WINDOW   = 20
 local TRASH_BOSS_NAME             = "Trash"
 
 local TRADE_WINDOW_SECONDS        = 7200   -- WotLK 3.3.5 BoP trade window
-local TRADE_TIMER_TICK_SECONDS    = 30     -- minute-granularity display
+local TRADE_TIMER_TICK_SECONDS    = 1      -- per-second panel refresh + real-time expiry cleanup
 -- Thresholds (seconds remaining) at which a chat alert is emitted.
 -- Order matters: higher thresholds fire first as time ticks down.
 local TRADE_ALERT_THRESHOLDS = {
@@ -384,6 +384,10 @@ local function EnsureDB()
     if LootTrackerDB.tradeTimers.enabled        == nil then LootTrackerDB.tradeTimers.enabled        = true  end
     if LootTrackerDB.tradeTimers.alerts         == nil then LootTrackerDB.tradeTimers.alerts         = true  end
     if LootTrackerDB.tradeTimers.panelCollapsed == nil then LootTrackerDB.tradeTimers.panelCollapsed = false end
+    -- How a right-click "mark as distributed" item is shown: "check" keeps it
+    -- in the Bosses list with a checkmark + "distributed" label; "remove" omits
+    -- it from the list. Either way it leaves the Trade Window panel and alerts.
+    if LootTrackerDB.distributedMode == nil then LootTrackerDB.distributedMode = "check" end
 end
 
 local function LogDebug(msg)
@@ -1979,22 +1983,52 @@ function LT:GetTradeTimerStatus(item)
 end
 
 -- Flat sorted list for the sticky panel. Soonest-expiring first.
+--
+-- Panel-only filters (the Bosses tab list is unaffected):
+--   * Distributed items follow the same distributedMode toggle as the Bosses
+--     list: in "check" mode (default) they stay in the panel — the UI renders
+--     them with the distributed marker instead of a countdown — and in "remove"
+--     mode they are dropped from the panel entirely.
+--   * In raid instances, sub-epic drops (quality < 4) are dropped so the panel
+--     reminds only about gear worth chasing a trade for. Dungeons (party) and
+--     any other instance type keep every quality. Quality is read from the link
+--     each call; an unresolvable quality (cold cache) is treated as non-epic
+--     and excluded in raids.
+-- The 2h trade window still gates everything: an item only appears while it
+-- still has remaining time, distributed or not.
 function LT:GetActiveTradeTimers(session)
     if not session or not session.bosses then return {} end
+    local raidFilter = session.instanceType == "raid"
+    local removeDistributed = LootTrackerDB and LootTrackerDB.distributedMode == "remove"
     local result = {}
     for _, boss in ipairs(session.bosses) do
         for _, item in ipairs(boss.items) do
             local remaining = self:GetTradeRemaining(item)
-            if remaining then
-                result[#result + 1] = {
-                    item         = item,
-                    boss         = boss,
-                    remainingSec = remaining,
-                }
+            if remaining and not (removeDistributed and item.distributed) then
+                local include = true
+                if raidFilter then
+                    local q = GetItemQualityFromLink(item.itemLink)
+                    include = (q ~= nil) and q >= 4
+                end
+                if include then
+                    result[#result + 1] = {
+                        item         = item,
+                        boss         = boss,
+                        remainingSec = remaining,
+                    }
+                end
             end
         end
     end
-    table.sort(result, function(a, b) return a.remainingSec < b.remainingSec end)
+    -- Still-to-trade items first (so the small visible window surfaces what the
+    -- player still needs to hand off), then distributed items; each group sorted
+    -- soonest-expiring first.
+    table.sort(result, function(a, b)
+        local ad = a.item.distributed and 1 or 0
+        local bd = b.item.distributed and 1 or 0
+        if ad ~= bd then return ad < bd end
+        return a.remainingSec < b.remainingSec
+    end)
     return result
 end
 
@@ -2059,7 +2093,9 @@ local function TickTradeTimers()
     for _, session in ipairs(LootTrackerDB.sessions or {}) do
         for _, boss in ipairs(session.bosses) do
             for _, item in ipairs(boss.items) do
-                if item.droppedAt then
+                -- Distributed items are settled: no countdown alerts, and they
+                -- must not keep the ticker alive on their own (anyLive).
+                if item.droppedAt and not item.distributed then
                     item.alertedThresholds = item.alertedThresholds or {}
                     -- Skip items already past the window AND already alerted
                     -- about expiry. Everything else still needs threshold
@@ -2127,8 +2163,8 @@ function LT:StartTradeTimerTicker()
             TickTradeTimers()
         end)
     end
-    -- Run one tick immediately so the UI / alerts react without waiting 30s
-    -- for the first OnUpdate after a fresh login.
+    -- Run one tick immediately so the UI / alerts react without waiting for
+    -- the first OnUpdate tick after a fresh login.
     tradeTickerElapsed = 0
     TickTradeTimers()
     tradeTickerFrame:Show()

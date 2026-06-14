@@ -17,15 +17,25 @@ local UNKNOWN_ICON      = "Interface\\Icons\\INV_Misc_QuestionMark"
 local PLUS_TEX          = "Interface\\Buttons\\UI-PlusButton-Up"
 local MINUS_TEX         = "Interface\\Buttons\\UI-MinusButton-Up"
 local HOURGLASS_TEX     = "Interface\\Icons\\INV_Misc_PocketWatch_01"
+local READYCHECK_TEX    = "Interface\\RaidFrame\\ReadyCheck-Ready"  -- green check for distributed items
 
 local STICKY_PANEL_ROW_H    = 18
 local STICKY_PANEL_HEADER_H = 20
 local STICKY_PANEL_GAP_BOT  = 4
--- Hard cap on visible rows so the sticky panel can't grow past the frame's
--- bottom edge. With FRAME_HEIGHT=500 and the panel anchored at y=-94, 10 rows
--- (20 + 10*18 + 4 = 204px) leaves ~190px for the scroll viewport below it.
--- Items past the cap are not rendered; the header indicates truncation.
-local STICKY_PANEL_MAX_ROWS = 10
+-- Cap on the panel's VISIBLE rows. The panel renders every eligible item into a
+-- scrollable body; this only bounds how many show at once. GetActiveTradeTimers
+-- sorts soonest-expiring first, so the visible window is always the 5 items
+-- closest to expiry and the rest are reachable by scrolling. Outer height when
+-- full: 20 + 5*18 + 4 = 114px, well within the space above the main viewport.
+local STICKY_PANEL_MAX_ROWS = 5
+
+-- Custom session-picker popup geometry. 3.3.5's native UIDropDownMenu has no
+-- scroll support, so the session selector uses a capped, scrollable popup that
+-- shows at most SESSION_PICKER_MAX_ROWS sessions and scrolls for the rest.
+local SESSION_PICKER_ROW_H    = 18
+local SESSION_PICKER_MAX_ROWS = 5
+local SESSION_PICKER_PAD      = 6    -- inner padding inside the popup backdrop
+local SESSION_PICKER_SBAR_W   = 18   -- scrollbar gutter reserved on overflow
 
 local ROLL_TYPE_TEX = {
     Need       = DICE_TEX,
@@ -74,6 +84,7 @@ local function FormatSessionLabel(s)
 end
 
 local Refresh              -- forward declared; assigned below, captured by closures defined later
+local ShowItemContextMenu  -- forward declared; assigned below, captured by row OnClick handlers
 
 local TAB_BOSSES, TAB_CURRENCIES, TAB_MATERIALS = "bosses", "currencies", "materials"
 local activeTab = TAB_BOSSES
@@ -144,7 +155,16 @@ local cogMenuFrame = CreateFrame("Frame", "LootTrackerCogMenu", UIParent, "UIDro
 
 local dropdown = CreateFrame("Frame", "LootTrackerSessionDropdown", frame, "UIDropDownMenuTemplate")
 dropdown:SetPoint("TOPLEFT", PAD - 16, -34)
-UIDropDownMenu_SetWidth(dropdown, FRAME_WIDTH_MIN - 60)
+
+-- Track the dropdown's logical width so the custom session picker can match it.
+-- Use SetDropdownWidth everywhere instead of calling UIDropDownMenu_SetWidth
+-- directly, so currentDropdownWidth always reflects the live value.
+local currentDropdownWidth = FRAME_WIDTH_MIN - 60
+local function SetDropdownWidth(w)
+    currentDropdownWidth = w
+    UIDropDownMenu_SetWidth(dropdown, w)
+end
+SetDropdownWidth(FRAME_WIDTH_MIN - 60)
 
 -- Tab strip between the session dropdown and the scroll area. Switches which
 -- view of the current session is shown (bosses / currencies / materials).
@@ -214,15 +234,40 @@ local tradePanelCaret = tradePanelHeader:CreateTexture(nil, "ARTWORK")
 tradePanelCaret:SetSize(14, 14)
 tradePanelCaret:SetPoint("RIGHT", -4, 0)
 
+-- Scrollable body for the trade rows. The panel renders ALL eligible items
+-- into tradeContent and clamps the visible viewport (tradeScroll) to at most
+-- STICKY_PANEL_MAX_ROWS tall; when more items exist the rest are reachable by
+-- scrolling instead of being truncated. The scrollbar is hidden when the full
+-- list already fits. Mirrors the main list's UIPanelScrollFrameTemplate.
+local tradeScroll = CreateFrame("ScrollFrame", "LootTrackerTradeScroll", tradePanel, "UIPanelScrollFrameTemplate")
+tradeScroll:Hide()
+-- UIPanelScrollFrameTemplate names its scrollbar "$parentScrollBar". Derive the
+-- global from the frame's own name rather than hardcoding the literal, so the
+-- lookup can't silently break if the scroll frame is ever renamed.
+local tradeScrollBar = _G[tradeScroll:GetName() .. "ScrollBar"]
+
+local tradeContent = CreateFrame("Frame", "LootTrackerTradeContent", tradeScroll)
+tradeContent:SetSize(1, 1)
+tradeScroll:SetScrollChild(tradeContent)
+
+tradeScroll:EnableMouseWheel(true)
+tradeScroll:SetScript("OnMouseWheel", function(self, delta)
+    local cur = self:GetVerticalScroll() or 0
+    local max = self:GetVerticalScrollRange() or 0
+    local new = cur - delta * STICKY_PANEL_ROW_H * 2
+    if new < 0 then new = 0 elseif new > max then new = max end
+    self:SetVerticalScroll(new)
+end)
+
 -- Indexed by render slot (1..N), unlike bossHeaderPool / itemRowPool / rollRowPool
 -- which use Acquire(pool, factory) with an inUse flag. Trade rows are rendered
 -- in a single deterministic pass each Refresh, so slot identity == pool index.
 local tradeRowPool = {}
 
 local function MakeTradeRow()
-    local r = CreateFrame("Button", nil, tradePanel)
+    local r = CreateFrame("Button", nil, tradeContent)
     r:SetHeight(STICKY_PANEL_ROW_H)
-    r:RegisterForClicks("LeftButtonUp")
+    r:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
     local hl = r:CreateTexture(nil, "HIGHLIGHT")
     hl:SetAllPoints()
@@ -276,6 +321,12 @@ local function MakeTradeRow()
         end
     end)
 
+    r:SetScript("OnClick", function(self, button)
+        if button == "RightButton" and self.item and ShowItemContextMenu then
+            ShowItemContextMenu(self.item)
+        end
+    end)
+
     r:Hide()
     return r
 end
@@ -296,6 +347,7 @@ local function ReleaseTradeRowsFrom(i)
             r:Hide()
             r:ClearAllPoints()
             r.itemLink = nil
+            r.item = nil
         end
     end
 end
@@ -370,7 +422,7 @@ end
 local function MakeItemRow()
     local r = CreateFrame("Button", nil, content)
     r:SetHeight(ROW_ITEM)
-    r:RegisterForClicks("LeftButtonUp")
+    r:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
     local highlight = r:CreateTexture(nil, "HIGHLIGHT")
     highlight:SetAllPoints()
@@ -386,6 +438,15 @@ local function MakeItemRow()
     r.icon:SetSize(ICON_SIZE, ICON_SIZE)
     r.icon:SetPoint("LEFT", 24, 0)
     r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+    -- "Distributed" marker: a green checkmark badge overlaid on the lower-left
+    -- corner of the item icon. Hidden by default; shown by RenderItemRowAt when
+    -- item.distributed and the display mode keeps the item in the list.
+    r.check = r:CreateTexture(nil, "OVERLAY")
+    r.check:SetSize(16, 16)
+    r.check:SetPoint("CENTER", r.icon, "BOTTOMLEFT", 2, 2)
+    r.check:SetTexture(READYCHECK_TEX)
+    r.check:Hide()
 
     r.nameText = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     r.nameText:SetPoint("LEFT", r.icon, "RIGHT", 6, 0)
@@ -452,7 +513,11 @@ local function MakeItemRow()
         end
     end)
 
-    r:SetScript("OnClick", function(self)
+    r:SetScript("OnClick", function(self, button)
+        if button == "RightButton" then
+            if self.item and ShowItemContextMenu then ShowItemContextMenu(self.item) end
+            return
+        end
         if self.linkHandled then
             self.linkHandled = false
             return
@@ -641,24 +706,168 @@ local function UpdateDropdownText()
     UIDropDownMenu_SetText(dropdown, s and FormatSessionLabel(s) or "No sessions yet")
 end
 
-local function InitDropdown(_, level)
+-- ---------------------------------------------------------------------------
+-- Custom session picker
+--
+-- Replaces the native UIDropDownMenu list, which in 3.3.5 has no scroll support
+-- and grows unbounded with many sessions. This popup expands downward from the
+-- dropdown button, shows at most SESSION_PICKER_MAX_ROWS sessions at once, and
+-- scrolls (scrollbar + mousewheel) through the rest. Sessions are listed newest
+-- first, matching the old dropdown ordering.
+-- ---------------------------------------------------------------------------
+
+local sessionPickerRowPool = {}
+
+-- Full-screen transparent catcher: a click anywhere outside the popup closes it
+-- (the native dropdown got this behavior for free). Parented to `frame` so it
+-- also vanishes when the main window is hidden.
+local pickerCloser = CreateFrame("Button", nil, frame)
+pickerCloser:SetFrameStrata("FULLSCREEN_DIALOG")
+pickerCloser:SetAllPoints(UIParent)
+pickerCloser:EnableMouse(true)
+pickerCloser:Hide()
+
+local sessionPicker = CreateFrame("Frame", "LootTrackerSessionPicker", frame)
+sessionPicker:SetFrameStrata("FULLSCREEN_DIALOG")
+sessionPicker:SetFrameLevel(pickerCloser:GetFrameLevel() + 10)
+sessionPicker:SetBackdrop({
+    bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 16,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+})
+sessionPicker:SetBackdropColor(0, 0, 0, 1)
+sessionPicker:Hide()
+
+local sessionScroll = CreateFrame("ScrollFrame", "LootTrackerSessionScroll", sessionPicker, "UIPanelScrollFrameTemplate")
+local sessionScrollBar = _G[sessionScroll:GetName() .. "ScrollBar"]
+local sessionContent = CreateFrame("Frame", nil, sessionScroll)
+sessionContent:SetSize(1, 1)
+sessionScroll:SetScrollChild(sessionContent)
+sessionScroll:EnableMouseWheel(true)
+sessionScroll:SetScript("OnMouseWheel", function(self, delta)
+    local cur = self:GetVerticalScroll() or 0
+    local max = self:GetVerticalScrollRange() or 0
+    local new = cur - delta * SESSION_PICKER_ROW_H
+    if new < 0 then new = 0 elseif new > max then new = max end
+    self:SetVerticalScroll(new)
+end)
+
+local function HideSessionPicker()
+    sessionPicker:Hide()
+    pickerCloser:Hide()
+end
+pickerCloser:SetScript("OnClick", HideSessionPicker)
+
+local function MakeSessionRow()
+    local r = CreateFrame("Button", nil, sessionContent)
+    r:SetHeight(SESSION_PICKER_ROW_H)
+    r:RegisterForClicks("LeftButtonUp")
+
+    local hl = r:CreateTexture(nil, "HIGHLIGHT")
+    hl:SetAllPoints()
+    hl:SetTexture(1, 1, 1, 0.10)
+    hl:SetBlendMode("ADD")
+
+    r.check = r:CreateTexture(nil, "ARTWORK")
+    r.check:SetSize(12, 12)
+    r.check:SetPoint("LEFT", 4, 0)
+    r.check:SetTexture("Interface\\Buttons\\UI-CheckBox-Check")
+
+    r.text = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    r.text:SetPoint("LEFT", r.check, "RIGHT", 4, 0)
+    r.text:SetPoint("RIGHT", -4, 0)
+    r.text:SetJustifyH("LEFT")
+
+    r:SetScript("OnClick", function(self)
+        if not self.sessionId then return end
+        currentDisplaySessionId = self.sessionId
+        UpdateDropdownText()
+        HideSessionPicker()
+        Refresh()
+    end)
+    r:Hide()
+    return r
+end
+
+local function AcquireSessionRow(i)
+    local r = sessionPickerRowPool[i]
+    if not r then
+        r = MakeSessionRow()
+        sessionPickerRowPool[i] = r
+    end
+    return r
+end
+
+-- Lay out the popup over the current session list. Sizes the viewport to at
+-- most SESSION_PICKER_MAX_ROWS rows and anchors the popup below the dropdown.
+local function RenderSessionPicker()
     local sessions = LT:GetSessions()
     local shown = GetDisplaySession()
-    for i = #sessions, 1, -1 do
+    local n = #sessions
+    if n == 0 then HideSessionPicker() return end
+
+    local y, idx = 0, 0
+    for i = n, 1, -1 do          -- newest first
+        idx = idx + 1
         local s = sessions[i]
-        local info = UIDropDownMenu_CreateInfo()
-        info.text  = FormatSessionLabel(s)
-        info.value = s.id
-        info.checked = (shown and shown.id == s.id)
-        info.func = function(self)
-            currentDisplaySessionId = self.value
-            UpdateDropdownText()
-            Refresh()
-        end
-        UIDropDownMenu_AddButton(info, level)
+        local r = AcquireSessionRow(idx)
+        r:SetPoint("TOPLEFT", 0, -y)
+        r:SetPoint("TOPRIGHT", 0, -y)
+        if shown and shown.id == s.id then r.check:Show() else r.check:Hide() end
+        r.text:SetText(FormatSessionLabel(s))
+        r.sessionId = s.id
+        r:Show()
+        y = y + SESSION_PICKER_ROW_H
     end
+    for j = idx + 1, #sessionPickerRowPool do
+        local r = sessionPickerRowPool[j]
+        if r then r:Hide(); r:ClearAllPoints(); r.sessionId = nil end
+    end
+
+    local fullH     = y
+    local viewportH = math.min(fullH, SESSION_PICKER_MAX_ROWS * SESSION_PICKER_ROW_H)
+    local overflow  = fullH > viewportH + 0.5
+    local width     = math.max(currentDropdownWidth + 24, 160)
+    local rightInset = overflow and SESSION_PICKER_SBAR_W or 0
+
+    sessionScroll:ClearAllPoints()
+    sessionScroll:SetPoint("TOPLEFT", SESSION_PICKER_PAD, -SESSION_PICKER_PAD)
+    sessionScroll:SetSize(math.max(width - rightInset, 1), viewportH)
+    sessionContent:SetSize(math.max(width - rightInset, 1), math.max(fullH, 1))
+
+    if sessionScrollBar then
+        if overflow then sessionScrollBar:Show() else sessionScrollBar:Hide() end
+    end
+    if not overflow then sessionScroll:SetVerticalScroll(0) end
+
+    sessionPicker:SetSize(width + SESSION_PICKER_PAD * 2, viewportH + SESSION_PICKER_PAD * 2)
+    sessionPicker:ClearAllPoints()
+    -- Expand downward from the dropdown's text region.
+    sessionPicker:SetPoint("TOPLEFT", dropdown, "BOTTOMLEFT", 16, 6)
 end
-UIDropDownMenu_Initialize(dropdown, InitDropdown)
+
+local function ToggleSessionPicker()
+    if sessionPicker:IsShown() then
+        HideSessionPicker()
+        return
+    end
+    if #LT:GetSessions() == 0 then return end
+    RenderSessionPicker()
+    pickerCloser:Show()
+    -- Re-assert ordering on every open so the popup (and its rows) always sit
+    -- above the click-catcher, independent of any later frame-level changes.
+    sessionPicker:SetFrameLevel(pickerCloser:GetFrameLevel() + 10)
+    sessionPicker:Show()
+end
+
+-- Hijack the native dropdown button: open our scrollable picker instead of the
+-- (unscrollable) UIDropDownMenu list. The widget itself is kept only for its
+-- label display (UIDropDownMenu_SetText) and width.
+local dropdownButton = _G["LootTrackerSessionDropdownButton"]
+if dropdownButton then
+    dropdownButton:SetScript("OnClick", function() ToggleSessionPicker() end)
+end
 
 StaticPopupDialogs["LOOTTRACKER_DELETE_ALL_CONFIRM"] = {
     text = "Delete all loot history?\nThis wipes every saved session.",
@@ -717,6 +926,29 @@ local function BuildCogMenu()
               LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
               LootTrackerDB.tradeTimers.alerts = not LootTrackerDB.tradeTimers.alerts
           end },
+        { text = "Distributed items", notCheckable = true, hasArrow = true,
+          menuList = {
+              { text = "Show with checkmark",
+                checked = function()
+                    return (LootTrackerDB and LootTrackerDB.distributedMode or "check") == "check"
+                end,
+                func = function()
+                    LootTrackerDB = LootTrackerDB or {}
+                    LootTrackerDB.distributedMode = "check"
+                    if Refresh then Refresh() end
+                    CloseDropDownMenus()
+                end },
+              { text = "Remove from list",
+                checked = function()
+                    return LootTrackerDB and LootTrackerDB.distributedMode == "remove"
+                end,
+                func = function()
+                    LootTrackerDB = LootTrackerDB or {}
+                    LootTrackerDB.distributedMode = "remove"
+                    if Refresh then Refresh() end
+                    CloseDropDownMenus()
+                end },
+          } },
         { text = "", notCheckable = true, disabled = true },
         { text = "Generate mock data", notCheckable = true,
           func = function()
@@ -746,11 +978,43 @@ cogBtn:SetScript("OnClick", function(self)
     EasyMenu(BuildCogMenu(), cogMenuFrame, self, 0, 0, "MENU")
 end)
 
+-- Right-click context menu shared by Bosses-list item rows and Trade Window
+-- rows. A single dropdown frame is reused for every row (EasyMenu rebuilds the
+-- entries from the clicked item each time). Toggling distributed flips the flag
+-- on the real item table (persisted) and refreshes; the rest of the pipeline
+-- (Trade Window filter, alert ticker, list rendering) reacts to the new state.
+local itemContextMenuFrame = CreateFrame("Frame", "LootTrackerItemContextMenu", UIParent, "UIDropDownMenuTemplate")
+
+-- Assigned (not declared) — forward-declared near the top so row OnClick
+-- closures defined earlier can call it.
+ShowItemContextMenu = function(item)
+    if not item then return end
+    local name = (item.itemLink and item.itemLink:match("%[(.-)%]")) or "Item"
+    local menu = {
+        { text = name, isTitle = true, notCheckable = true },
+        { text = item.distributed and "Unmark distributed" or "Mark as distributed",
+          notCheckable = true,
+          func = function()
+              item.distributed = (not item.distributed) or nil
+              -- Unmarking turns a static "distributed" row back into a live
+              -- countdown, which needs the per-second ticker running. It may have
+              -- self-stopped (e.g. this was the only in-window item and it was
+              -- distributed, so nothing kept it alive). Restart it; harmless when
+              -- already running — TickTradeTimers re-hides it if nothing is live.
+              if LT.StartTradeTimerTicker then LT:StartTradeTimerTicker() end
+              if Refresh then Refresh() end
+          end },
+        { text = CANCEL or "Cancel", notCheckable = true, func = function() end },
+    }
+    EasyMenu(menu, itemContextMenuFrame, "cursor", 0, 0, "MENU")
+end
+
 -- ---------------------------------------------------------------------------
 -- Layout + viewport-aware render
 -- ---------------------------------------------------------------------------
 
 local function ComputeLayout(session)
+    local removeMode = LootTrackerDB and LootTrackerDB.distributedMode == "remove"
     local entries = {}
     local y = PAD
     for _, boss in ipairs(session.bosses) do
@@ -758,17 +1022,19 @@ local function ComputeLayout(session)
         y = y + ROW_BOSS_HEADER + 2
         if not boss.collapsed then
             for _, item in ipairs(boss.items) do
-                entries[#entries + 1] = { y = y, h = ROW_ITEM, kind = "item", data = item }
-                y = y + ROW_ITEM
-                if item.expanded then
-                    if #item.rolls == 0 then
-                        entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "empty", data = item }
-                        y = y + ROW_ROLL
-                    else
-                        for _, roll in ipairs(item.rolls) do
-                            entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "roll",
-                                data = roll, parentItem = item }
+                if not (removeMode and item.distributed) then
+                    entries[#entries + 1] = { y = y, h = ROW_ITEM, kind = "item", data = item }
+                    y = y + ROW_ITEM
+                    if item.expanded then
+                        if #item.rolls == 0 then
+                            entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "empty", data = item }
                             y = y + ROW_ROLL
+                        else
+                            for _, roll in ipairs(item.rolls) do
+                                entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "roll",
+                                    data = roll, parentItem = item }
+                                y = y + ROW_ROLL
+                            end
                         end
                     end
                 end
@@ -844,6 +1110,37 @@ local function RenderItemRowAt(item, width, y)
     row.icon:ClearAllPoints()
     row.icon:SetPoint("LEFT", 24, 0)
 
+    -- Reset distributed visuals (rows are pooled). The distributed branch below
+    -- re-applies them when needed.
+    row.icon:SetDesaturated(false)
+    row.check:Hide()
+
+    if item.distributed then
+        -- Settled item: green check on the icon, the timer slot reads a dim
+        -- "distributed" instead of a countdown, and no last-minute pulse runs.
+        -- (In remove-mode ComputeLayout omits the row entirely, so this only
+        -- paints in check-mode — but it's safe regardless of mode.)
+        row.check:Show()
+        row.icon:SetDesaturated(true)
+        if row.timerFrame.pulseStarted then
+            row.timerFrame:SetScript("OnUpdate", nil)
+            row.timerFrame.pulseStarted = false
+        end
+        row.timerIcon:Hide()
+        row.timerText:SetText("|cff888888distributed|r")
+        row.timerFrame:SetAlpha(1)
+        row.timerFrame:Show()
+        row.nameText:ClearAllPoints()
+        row.nameText:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
+        row.nameText:SetPoint("RIGHT", row.timerFrame, "LEFT", -4, 0)
+        row:Show()
+        return
+    end
+
+    -- Non-distributed rows always show the hourglass icon (a previously
+    -- distributed render may have hidden it before the row was pooled).
+    row.timerIcon:Show()
+
     local status = LT:GetTradeTimerStatus(item)
     local timersEnabled = LootTrackerDB and LootTrackerDB.tradeTimers
         and LootTrackerDB.tradeTimers.enabled
@@ -861,10 +1158,12 @@ local function RenderItemRowAt(item, width, y)
         -- row is released to its pool (see ReleaseAll).
         if status.remainingSec <= 60 then
             if not row.timerFrame.pulseStarted then
-                local elapsed = 0
-                row.timerFrame:SetScript("OnUpdate", function(self, dt)
-                    elapsed = elapsed + dt
-                    self:SetAlpha(0.4 + 0.6 * (math.sin(elapsed * 4) * 0.5 + 0.5))
+                -- Phase the pulse off GetTime() rather than accumulated dt so it
+                -- stays continuous across the per-second Refresh teardown/rebuild
+                -- (ReleaseAll clears this script every refresh) instead of
+                -- restarting the sine wave each tick.
+                row.timerFrame:SetScript("OnUpdate", function(self)
+                    self:SetAlpha(0.4 + 0.6 * (math.sin(GetTime() * 4) * 0.5 + 0.5))
                 end)
                 row.timerFrame.pulseStarted = true
             end
@@ -1054,6 +1353,11 @@ local function RenderAggregateTab(bucket, emptyText)
         row:SetPoint("TOPLEFT", 0, -y)
         row.item     = nil
         SetItemIcon(row.icon, rec.itemId)
+        -- Aggregate rows never carry distributed state; clear the marker the
+        -- shared item-row pool may have left behind from a Bosses-tab render.
+        row.check:Hide()
+        row.icon:SetDesaturated(false)
+        row.timerIcon:Show()
         local itemLink = ResolveAggregateLink(rec.entry, rec.itemId)
         row.itemLink = itemLink
         row.expand:Hide()
@@ -1101,7 +1405,7 @@ local function ResetFrameWidthToMin()
     if math.abs(frame:GetWidth() - FRAME_WIDTH_MIN) > 0.5 then
         frame:SetWidth(FRAME_WIDTH_MIN)
         content:SetWidth(FRAME_WIDTH_MIN - PAD - 28)
-        UIDropDownMenu_SetWidth(dropdown, math.max(FRAME_WIDTH_MIN - 60, 150))
+        SetDropdownWidth(math.max(FRAME_WIDTH_MIN - 60, 150))
     end
 end
 
@@ -1113,6 +1417,7 @@ local function RenderTradePanel(session)
         and LootTrackerDB.tradeTimers.enabled
     if not enabled or activeTab ~= TAB_BOSSES or #timers == 0 then
         tradePanel:Hide()
+        tradeScroll:Hide()
         ReleaseTradeRowsFrom(1)
         return 0
     end
@@ -1120,70 +1425,105 @@ local function RenderTradePanel(session)
     local collapsed = LootTrackerDB.tradeTimers.panelCollapsed
     tradePanelCaret:SetTexture(collapsed and PLUS_TEX or MINUS_TEX)
 
-    if collapsed then
-        tradePanelTitle:SetText(string.format(
-            "|cffffd200Trade Window (%d %s)|r",
-            #timers, (#timers == 1) and "item" or "items"))
+    -- Re-check each timer's status ONCE here, before the collapsed/expanded
+    -- split. GetActiveTradeTimers already filtered by remaining time, but a
+    -- sub-second tick can push an item past expiry between that scan and now;
+    -- doing the recheck up front means the header count, the rendered rows, and
+    -- the collapsed-state count are all derived from the same `eligible` list
+    -- and can never disagree. Each entry caches its status so the render loop
+    -- below doesn't call GetTradeTimerStatus a second time.
+    local eligible = {}
+    for _, info in ipairs(timers) do
+        local status = LT:GetTradeTimerStatus(info.item)
+        if status then
+            eligible[#eligible + 1] = { item = info.item, status = status }
+        end
+    end
+    local count = #eligible
+
+    if count == 0 then
+        -- Every item in `timers` flipped past expiry between the initial scan
+        -- and this recheck (extreme edge case). Hide the panel entirely rather
+        -- than show an empty body or a misleading header count.
+        tradePanel:Hide()
+        tradeScroll:Hide()
         ReleaseTradeRowsFrom(1)
+        return 0
+    end
+
+    tradePanelTitle:SetText(string.format(
+        "|cffffd200Trade Window (%d %s)|r",
+        count, (count == 1) and "item" or "items"))
+
+    if collapsed then
+        ReleaseTradeRowsFrom(1)
+        tradeScroll:Hide()
         tradePanel:SetHeight(STICKY_PANEL_HEADER_H)
         tradePanel:Show()
         return STICKY_PANEL_HEADER_H + STICKY_PANEL_GAP_BOT
     end
 
-    -- Track rendered slot separately from list index so an item whose status
-    -- flips to nil mid-render (caught the exact expiry boundary between
-    -- GetActiveTradeTimers and per-item GetTradeTimerStatus) doesn't leave a
-    -- stale acquired row at index i. Without this, the pool slot at i would
-    -- still be marked Shown from its previous render and overlap the next
-    -- successfully rendered row.
-    local renderedCount = 0
-    local eligibleCount = 0
-    local y = STICKY_PANEL_HEADER_H
-    for _, info in ipairs(timers) do
-        local status = LT:GetTradeTimerStatus(info.item)
-        if status then
-            eligibleCount = eligibleCount + 1
-            if renderedCount < STICKY_PANEL_MAX_ROWS then
-                renderedCount = renderedCount + 1
-                local r = AcquireTradeRow(renderedCount)
-                r:SetPoint("TOPLEFT", 0, -y)
-                r:SetPoint("TOPRIGHT", 0, -y)
-                r.itemLink     = info.item.itemLink
-                r.droppedAt    = info.item.droppedAt
-                r.remainingSec = status.remainingSec
-                r.timer:SetText(string.format("|cff%s%s|r", status.color, status.text))
-                r.nameText:SetText(info.item.itemLink or "?")
-                r:Show()
-                y = y + STICKY_PANEL_ROW_H
-            end
+    -- Render ALL eligible items into the scrollable content (no truncation).
+    -- Rows are parented to tradeContent and anchored from y=0 (the header sits
+    -- above the scroll viewport, not inside it).
+    local y = 0
+    for i, e in ipairs(eligible) do
+        local r = AcquireTradeRow(i)
+        r:SetPoint("TOPLEFT", 0, -y)
+        r:SetPoint("TOPRIGHT", 0, -y)
+        r.item         = e.item
+        r.itemLink     = e.item.itemLink
+        r.droppedAt    = e.item.droppedAt
+        r.remainingSec = e.status.remainingSec
+        if e.item.distributed then
+            -- Shown only in "check" mode (remove-mode filters these out in
+            -- GetActiveTradeTimers). Swap the hourglass for a green check and
+            -- the countdown for a dim "distributed" label.
+            r.icon:SetTexture(READYCHECK_TEX)
+            r.icon:SetTexCoord(0, 1, 0, 1)
+            r.timer:SetText("|cff888888distributed|r")
+        else
+            -- Restore the hourglass on pooled rows reused from a distributed one.
+            r.icon:SetTexture(HOURGLASS_TEX)
+            r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+            r.timer:SetText(string.format("|cff%s%s|r", e.status.color, e.status.text))
         end
+        r.nameText:SetText(e.item.itemLink or "?")
+        r:Show()
+        y = y + STICKY_PANEL_ROW_H
     end
-    ReleaseTradeRowsFrom(renderedCount + 1)
+    ReleaseTradeRowsFrom(count + 1)
 
-    -- Header reflects truncation when more items qualify than fit. The
-    -- header count uses eligibleCount (post-status filter) rather than
-    -- #timers so a momentary expiry-boundary race doesn't mis-report.
-    if eligibleCount > renderedCount then
-        tradePanelTitle:SetText(string.format(
-            "|cffffd200Trade Window (%d items, showing %d soonest)|r",
-            eligibleCount, renderedCount))
-    else
-        tradePanelTitle:SetText(string.format(
-            "|cffffd200Trade Window (%d %s)|r",
-            eligibleCount, (eligibleCount == 1) and "item" or "items"))
+    -- Clamp the visible viewport to STICKY_PANEL_MAX_ROWS; the rest scrolls.
+    local fullH     = y
+    local viewportH = math.min(fullH, STICKY_PANEL_MAX_ROWS * STICKY_PANEL_ROW_H)
+    local overflow  = fullH > viewportH + 0.5
+
+    -- Reserve the scrollbar gutter only when the list overflows, so a short
+    -- list uses the full panel width.
+    local rightInset = overflow and -22 or 0
+    tradeScroll:ClearAllPoints()
+    tradeScroll:SetPoint("TOPLEFT", 0, -STICKY_PANEL_HEADER_H)
+    tradeScroll:SetPoint("TOPRIGHT", rightInset, -STICKY_PANEL_HEADER_H)
+    tradeScroll:SetHeight(viewportH)
+
+    -- Resolve content width with the same three-level fallback the main list
+    -- uses (anchoring is deferred, so GetWidth can lag one frame after SetPoint).
+    local w = tradeScroll:GetWidth()
+    if not w or w < 1 then w = (tradePanel:GetWidth() or 0) + rightInset end
+    if not w or w < 1 then w = frame:GetWidth() - PAD - 28 + rightInset end
+    tradeContent:SetWidth(math.max(w, 1))
+    tradeContent:SetHeight(math.max(fullH, 1))
+
+    if tradeScrollBar then
+        if overflow then tradeScrollBar:Show() else tradeScrollBar:Hide() end
     end
+    if not overflow then tradeScroll:SetVerticalScroll(0) end
+    tradeScroll:Show()
 
-    if renderedCount == 0 then
-        -- Every item in `timers` flipped past expiry between the initial scan
-        -- and the render pass (extreme edge case). Hide the panel entirely
-        -- rather than show an empty body.
-        tradePanel:Hide()
-        return 0
-    end
-
-    tradePanel:SetHeight(y)
+    tradePanel:SetHeight(STICKY_PANEL_HEADER_H + viewportH)
     tradePanel:Show()
-    return y + STICKY_PANEL_GAP_BOT
+    return STICKY_PANEL_HEADER_H + viewportH + STICKY_PANEL_GAP_BOT
 end
 
 -- Re-anchor the scroll viewport based on the sticky panel's current height.
@@ -1199,7 +1539,12 @@ end
 Refresh = function(reason)
     if not frame:IsShown() then return end
 
-    if reason ~= "scroll" then layoutDirty = true end
+    -- "scroll" and "timer" reuse the cached layout: neither changes item
+    -- geometry (scrolling moves the viewport; a timer tick only updates badge
+    -- text + drops expired trade rows). Forcing ComputeLayout/ComputeAutoWidth
+    -- on every 1s tick would be wasted work — the visible rows still re-render
+    -- below from layoutCache, so inline timer badges update either way.
+    if reason ~= "scroll" and reason ~= "timer" then layoutDirty = true end
 
     ReleaseAll()
     local session = GetDisplaySession()
@@ -1235,7 +1580,7 @@ Refresh = function(reason)
                 -- so without this, the first row-render below would use stale width.
                 content:SetWidth(target - PAD - 28)
             end
-            UIDropDownMenu_SetWidth(dropdown, math.max(target - 60, 150))
+            SetDropdownWidth(math.max(target - 60, 150))
         end
         content:SetHeight(math.max(layoutTotalH, 1))
 
@@ -1300,7 +1645,11 @@ LT:On("ItemReceived",      OnDataChanged)
 LT:On("RollAdded",         OnDataChanged)
 LT:On("CurrencyReceived",  OnDataChanged)
 LT:On("MaterialReceived",  OnDataChanged)
-LT:On("TradeTimerTick",    OnDataChanged)
+-- Timer ticks fire every second once any trade window is live. They only
+-- affect countdown text and expired-row removal, not the session list or item
+-- geometry, so refresh with the layout-preserving "timer" reason and skip the
+-- dropdown rebuild OnDataChanged would otherwise do each second.
+LT:On("TradeTimerTick",    function() Refresh("timer") end)
 
 -- INSPECT_TALENT_READY can fire several times per second in raids (other
 -- addons doing their own inspects also trigger it). Debounce so we don't
