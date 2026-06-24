@@ -85,9 +85,17 @@ end
 
 local Refresh              -- forward declared; assigned below, captured by closures defined later
 local ShowItemContextMenu  -- forward declared; assigned below, captured by row OnClick handlers
+local UpdateMinimapButton  -- forward declared; assigned in the minimap-button block below
 
 local TAB_BOSSES, TAB_CURRENCIES, TAB_MATERIALS = "bosses", "currencies", "materials"
 local activeTab = TAB_BOSSES
+
+-- Current search filter (lower-cased), driven by the Bosses-tab search box.
+-- Read by ComputeLayout; empty string means "no filter".
+local searchQuery = ""
+
+local SEARCH_ROW_H = 26   -- height reserved for the Bosses-tab search row
+local BOE_TAG = "  |cff66bbffBoE|r"  -- appended to BoE item labels everywhere
 
 -- ---------------------------------------------------------------------------
 -- Main frame
@@ -151,8 +159,6 @@ cogBtn:SetScript("OnEnter", function(self)
 end)
 cogBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-local cogMenuFrame = CreateFrame("Frame", "LootTrackerCogMenu", UIParent, "UIDropDownMenuTemplate")
-
 local dropdown = CreateFrame("Frame", "LootTrackerSessionDropdown", frame, "UIDropDownMenuTemplate")
 dropdown:SetPoint("TOPLEFT", PAD - 16, -34)
 
@@ -201,6 +207,60 @@ UpdateTabVisuals = function()
     if activeTab == TAB_MATERIALS then tabMaterials:Disable() else tabMaterials:Enable() end
 end
 UpdateTabVisuals()
+
+-- ---------------------------------------------------------------------------
+-- Search box (Bosses tab only)
+--
+-- Filters the tracked-loot list by a case-insensitive substring of the item
+-- name OR a recipient/roller name (see ItemMatchesSearch). Positioned at the
+-- top of the content area by Refresh on the Bosses tab and hidden on the
+-- aggregate tabs.
+-- ---------------------------------------------------------------------------
+
+local searchBox = CreateFrame("EditBox", "LootTrackerSearchBox", frame, "InputBoxTemplate")
+searchBox:SetAutoFocus(false)
+searchBox:SetHeight(18)
+searchBox:SetFontObject("GameFontHighlightSmall")
+searchBox:Hide()
+
+local searchPlaceholder = searchBox:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+-- InputBoxTemplate insets its editable text ~6px from the left border; match
+-- that so the placeholder sits where the typed text (and caret) will appear.
+searchPlaceholder:SetPoint("LEFT", 6, 0)
+searchPlaceholder:SetText("Search item or player  (Enter/Esc to unfocus)")
+
+-- Small clear ("X") button shown only while the box has text. UIPanelCloseButton
+-- scaled down gives a recognizable X without guessing at a search-clear texture
+-- (3.3.5 has no SearchBoxTemplate).
+local searchClear = CreateFrame("Button", nil, searchBox, "UIPanelCloseButton")
+searchClear:SetSize(20, 20)
+searchClear:SetPoint("RIGHT", searchBox, "RIGHT", 4, 0)
+searchClear:Hide()
+
+local function UpdateSearchChrome()
+    if (searchBox:GetText() or "") == "" then
+        searchPlaceholder:Show()
+        searchClear:Hide()
+    else
+        searchPlaceholder:Hide()
+        searchClear:Show()
+    end
+end
+
+searchBox:SetScript("OnTextChanged", function(self)
+    searchQuery = (self:GetText() or ""):lower()
+    UpdateSearchChrome()
+    if Refresh then Refresh() end
+end)
+searchBox:SetScript("OnEscapePressed", function(self)
+    self:SetText("")
+    self:ClearFocus()
+end)
+searchBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+searchClear:SetScript("OnClick", function()
+    searchBox:SetText("")
+    searchBox:ClearFocus()
+end)
 
 -- ---------------------------------------------------------------------------
 -- Sticky "Trade Window" panel (above the scroll viewport, Bosses tab only)
@@ -300,8 +360,13 @@ local function MakeTradeRow()
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine(string.format(
                 "Trade window: %dm %02ds remaining", mins, secs), 1, 1, 1)
+            -- Deadline = now + the monotonic remaining shown above, so "Expires
+            -- at" always agrees with the countdown — including after a backward
+            -- clock shift, where droppedAt + window would diverge from the
+            -- (frozen) countdown. remainingSec is the monotonic value from
+            -- GetTradeRemaining, refreshed each per-second render.
             GameTooltip:AddLine(string.format(
-                "Expires at %s", date("%I:%M:%S %p", self.droppedAt + 7200)),
+                "Expires at %s", date("%I:%M:%S %p", time() + self.remainingSec)),
                 0.7, 0.7, 0.7)
         end
         GameTooltip:Show()
@@ -323,7 +388,7 @@ local function MakeTradeRow()
 
     r:SetScript("OnClick", function(self, button)
         if button == "RightButton" and self.item and ShowItemContextMenu then
-            ShowItemContextMenu(self.item)
+            ShowItemContextMenu(self.item, self.copies)
         end
     end)
 
@@ -348,6 +413,9 @@ local function ReleaseTradeRowsFrom(i)
             r:ClearAllPoints()
             r.itemLink = nil
             r.item = nil
+            r.copies = nil
+            r.droppedAt = nil
+            r.remainingSec = nil
         end
     end
 end
@@ -373,16 +441,17 @@ scroll:SetScript("OnSizeChanged", function(self, w, h)
     content:SetWidth(w)
 end)
 
+local EMPTY_DEFAULT_TEXT = "No loot tracked yet.\nKill a boss in a dungeon or raid."
 local emptyLabel = content:CreateFontString(nil, "OVERLAY", "GameFontDisableLarge")
 emptyLabel:SetPoint("TOP", 0, -PAD)
-emptyLabel:SetText("No loot tracked yet.\nKill a boss in a dungeon or raid.")
+emptyLabel:SetText(EMPTY_DEFAULT_TEXT)
 emptyLabel:SetJustifyH("CENTER")
 
 -- ---------------------------------------------------------------------------
 -- Row pools
 -- ---------------------------------------------------------------------------
 
-local bossHeaderPool, itemRowPool, rollRowPool = {}, {}, {}
+local bossHeaderPool, itemRowPool, rollRowPool, playerHeaderPool = {}, {}, {}, {}
 local iconQueue = {}     -- widget -> itemId, polled by shared ticker
 local scanner, iconTicker
 
@@ -413,6 +482,49 @@ local function MakeBossHeader()
     r:SetScript("OnClick", function(self)
         if not self.boss then return end
         self.boss.collapsed = not self.boss.collapsed or nil
+        Refresh()
+    end)
+    r:Hide()
+    return r
+end
+
+-- Per-player group header for the Currencies / Materials tabs. Mirrors the boss
+-- header (expand caret + class-colored name on the left) but pins a class icon
+-- to the right edge in place of the boss timestamp. OnClick toggles the
+-- player's collapse state in whichever table was handed to it at render time.
+local function MakePlayerHeader()
+    local r = CreateFrame("Button", nil, content)
+    r:SetHeight(ROW_BOSS_HEADER)
+    r:RegisterForClicks("LeftButtonUp")
+
+    local bg = r:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetTexture(0.15, 0.15, 0.25, 0.55)
+
+    local highlight = r:CreateTexture(nil, "HIGHLIGHT")
+    highlight:SetAllPoints()
+    highlight:SetTexture(1, 1, 1, 0.08)
+    highlight:SetBlendMode("ADD")
+
+    r.expand = r:CreateTexture(nil, "ARTWORK")
+    r.expand:SetSize(14, 14)
+    r.expand:SetPoint("LEFT", 4, 0)
+
+    r.classIcon = r:CreateTexture(nil, "ARTWORK")
+    r.classIcon:SetSize(16, 16)
+    r.classIcon:SetPoint("RIGHT", -6, 0)
+    r.classIcon:SetTexture(CLASS_TEX)
+
+    r.text = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    r.text:SetPoint("LEFT", r.expand, "RIGHT", 4, 0)
+    r.text:SetPoint("RIGHT", r.classIcon, "LEFT", -4, 0)
+    r.text:SetJustifyH("LEFT")
+
+    r:SetScript("OnClick", function(self)
+        if not self.player or not self.collapsedTable then return end
+        -- Store the explicit opposite of the rendered state, so the first click
+        -- always flips what the user currently sees regardless of the default.
+        self.collapsedTable[self.player] = not self.isCollapsed
         Refresh()
     end)
     r:Hide()
@@ -481,8 +593,10 @@ local function MakeItemRow()
             local secs = math.floor(remaining % 60)
             GameTooltip:AddLine(string.format(
                 "Trade window: %dm %02ds remaining", mins, secs), 1, 1, 1)
+            -- See the sticky-panel tooltip: deadline = now + the monotonic
+            -- remaining so it agrees with the countdown after a clock shift.
             GameTooltip:AddLine(string.format(
-                "Expires at %s", date("%I:%M:%S %p", item.droppedAt + 7200)),
+                "Expires at %s", date("%I:%M:%S %p", time() + remaining)),
                 0.7, 0.7, 0.7)
         end
         GameTooltip:Show()
@@ -515,7 +629,9 @@ local function MakeItemRow()
 
     r:SetScript("OnClick", function(self, button)
         if button == "RightButton" then
-            if self.item and ShowItemContextMenu then ShowItemContextMenu(self.item) end
+            if self.item and ShowItemContextMenu then
+                ShowItemContextMenu(self.item, self.copies)
+            end
             return
         end
         if self.linkHandled then
@@ -590,7 +706,7 @@ local function ReleaseAll()
             r.inUse = false
             r:Hide()
             r:ClearAllPoints()
-            r.item, r.itemLink = nil, nil
+            r.item, r.itemLink, r.copies = nil, nil, nil
             if r.timerFrame then
                 if r.timerFrame.pulseStarted then
                     r.timerFrame:SetScript("OnUpdate", nil)
@@ -612,6 +728,14 @@ local function ReleaseAll()
         if r.inUse then
             r.inUse = false
             r.boss = nil
+            r:Hide()
+            r:ClearAllPoints()
+        end
+    end
+    for _, r in ipairs(playerHeaderPool) do
+        if r.inUse then
+            r.inUse = false
+            r.player, r.collapsedTable = nil, nil
             r:Hide()
             r:ClearAllPoints()
         end
@@ -901,82 +1025,376 @@ StaticPopupDialogs["LOOTTRACKER_DELETE_SESSION_CONFIRM"] = {
     hideOnEscape = true,
 }
 
-local function BuildCogMenu()
-    local current = GetDisplaySession()
-    return {
-        { text = "Loot Tracker", isTitle = true, notCheckable = true },
-        { text = "Trade timers", isNotRadio = true, keepShownOnClick = true,
-          checked = function()
-              return LootTrackerDB and LootTrackerDB.tradeTimers
-                  and LootTrackerDB.tradeTimers.enabled
-          end,
-          func = function()
-              LootTrackerDB = LootTrackerDB or {}
-              LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
-              LootTrackerDB.tradeTimers.enabled = not LootTrackerDB.tradeTimers.enabled
-              if Refresh then Refresh() end
-          end },
-        { text = "Mute trade alerts", isNotRadio = true, keepShownOnClick = true,
-          checked = function()
-              return LootTrackerDB and LootTrackerDB.tradeTimers
-                  and not LootTrackerDB.tradeTimers.alerts
-          end,
-          func = function()
-              LootTrackerDB = LootTrackerDB or {}
-              LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
-              LootTrackerDB.tradeTimers.alerts = not LootTrackerDB.tradeTimers.alerts
-          end },
-        { text = "Distributed items", notCheckable = true, hasArrow = true,
-          menuList = {
-              { text = "Show with checkmark",
-                checked = function()
-                    return (LootTrackerDB and LootTrackerDB.distributedMode or "check") == "check"
-                end,
-                func = function()
-                    LootTrackerDB = LootTrackerDB or {}
-                    LootTrackerDB.distributedMode = "check"
-                    if Refresh then Refresh() end
-                    CloseDropDownMenus()
-                end },
-              { text = "Remove from list",
-                checked = function()
-                    return LootTrackerDB and LootTrackerDB.distributedMode == "remove"
-                end,
-                func = function()
-                    LootTrackerDB = LootTrackerDB or {}
-                    LootTrackerDB.distributedMode = "remove"
-                    if Refresh then Refresh() end
-                    CloseDropDownMenus()
-                end },
-          } },
-        { text = "", notCheckable = true, disabled = true },
-        { text = "Generate mock data", notCheckable = true,
-          func = function()
-              LT:GenerateMockData()
-              if not frame:IsShown() then frame:Show() else Refresh() end
-          end },
-        { text = "", notCheckable = true, disabled = true },
-        { text = "Delete current session...", notCheckable = true,
-          disabled = (current == nil),
-          func = function()
-              local s = GetDisplaySession()
-              if not s then return end
-              StaticPopup_Show("LOOTTRACKER_DELETE_SESSION_CONFIRM",
-                  FormatSessionLabel(s), nil, s.id)
-          end },
-        { text = "Delete all sessions...", notCheckable = true,
-          func = function() StaticPopup_Show("LOOTTRACKER_DELETE_ALL_CONFIRM") end },
-        { text = "", notCheckable = true, disabled = true },
-        { text = "Close window", notCheckable = true,
-          func = function() frame:Hide() end },
-        { text = "Cancel", notCheckable = true,
-          func = function() end },
-    }
+-- ---------------------------------------------------------------------------
+-- Settings panel
+--
+-- A single organized window (sectioned, two columns) that replaces the old cog
+-- dropdown. Opened by the gear button and by right-clicking the minimap button.
+-- Every control binds directly to LootTrackerDB and applies live; RefreshSettings
+-- re-reads each control so checks/radios stay in sync however a value changed.
+-- Being its own window, it has no context-specific entries (the old menu's
+-- "Close window"/"Cancel" made no sense from the minimap).
+-- ---------------------------------------------------------------------------
+
+-- Height matches the main window so the two line up (top and bottom) when the
+-- panel is docked to its left. The left column (Trade Window + the "Scan bags
+-- now" action + Announce tiers + Minimap) is kept compact enough to fit within
+-- it — the trade-section description spacing is tuned so nothing spills over.
+local SETTINGS_W, SETTINGS_H = 480, FRAME_HEIGHT
+local COLUMN_W = 216
+local LX, RX   = 20, 246          -- left / right column x
+local SEC_GAP  = 10               -- gap after a section
+local DESC_INDENT = 24            -- align option descriptions under the label
+
+local settings = CreateFrame("Frame", "LootTrackerSettingsFrame", UIParent)
+settings:SetSize(SETTINGS_W, SETTINGS_H)
+settings:SetPoint("CENTER")
+settings:SetFrameStrata("FULLSCREEN_DIALOG")
+settings:SetToplevel(true)
+settings:EnableMouse(true)
+settings:SetMovable(true)
+settings:RegisterForDrag("LeftButton")
+settings:SetScript("OnDragStart", settings.StartMoving)
+settings:SetScript("OnDragStop", settings.StopMovingOrSizing)
+settings:SetBackdrop({
+    bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 32, edgeSize = 32,
+    insets = { left = 11, right = 12, top = 12, bottom = 11 },
+})
+settings:Hide()
+table.insert(UISpecialFrames, "LootTrackerSettingsFrame")  -- Escape closes it
+
+local settingsHeaderTex = settings:CreateTexture(nil, "ARTWORK")
+settingsHeaderTex:SetTexture("Interface\\DialogFrame\\UI-DialogBox-Header")
+settingsHeaderTex:SetSize(256, 64)
+settingsHeaderTex:SetPoint("TOP", 0, 12)
+local settingsTitle = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+settingsTitle:SetPoint("TOP", settingsHeaderTex, "TOP", 0, -14)
+settingsTitle:SetText("Loot Tracker Settings")
+
+local settingsClose = CreateFrame("Button", nil, settings, "UIPanelCloseButton")
+settingsClose:SetPoint("TOPRIGHT", -4, -4)
+
+-- Controls register a :refresh that re-reads their bound value.
+local settingsControls = {}
+local function RefreshSettings()
+    for _, c in ipairs(settingsControls) do c.refresh() end
+end
+-- After any change: the setter has persisted to DB; sync the panel, the main
+-- list, and the minimap button so everything reflects the new value at once.
+local function AfterSettingChange()
+    RefreshSettings()
+    if Refresh then Refresh() end
+    if UpdateMinimapButton then UpdateMinimapButton() end
 end
 
-cogBtn:SetScript("OnClick", function(self)
-    EasyMenu(BuildCogMenu(), cogMenuFrame, self, 0, 0, "MENU")
+local function TT()  -- ensure + return the tradeTimers sub-table
+    LootTrackerDB = LootTrackerDB or {}
+    LootTrackerDB.tradeTimers = LootTrackerDB.tradeTimers or {}
+    return LootTrackerDB.tradeTimers
+end
+
+-- A grey wrapped help line. `indent` aligns it under an option's label;
+-- header descriptions pass indent 0 to span the full column. Kept short (one
+-- line at the column width). Returns the y below it.
+local function AddDesc(colX, y, text, indent)
+    if not text then return y end
+    local fs = settings:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    fs:SetPoint("TOPLEFT", colX + indent, y)
+    fs:SetWidth(COLUMN_W - indent)
+    fs:SetJustifyH("LEFT")
+    fs:SetText(text)
+    return y - 15
+end
+
+local function SettingsHeader(colX, y, text, desc)
+    local fs = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    fs:SetPoint("TOPLEFT", colX, y)
+    fs:SetText("|cffffd200" .. text .. "|r")
+    local line = settings:CreateTexture(nil, "ARTWORK")
+    line:SetTexture(1, 1, 1, 0.12)
+    line:SetSize(COLUMN_W, 1)
+    line:SetPoint("TOPLEFT", colX, y - 16)
+    y = AddDesc(colX, y - 20, desc, 0)
+    return y - 4
+end
+
+local function MakeCheck(colX, y, label, desc, getFn, setFn)
+    local b = CreateFrame("CheckButton", nil, settings, "UICheckButtonTemplate")
+    b:SetSize(22, 22)
+    b:SetPoint("TOPLEFT", colX, y)
+    local t = b:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    t:SetPoint("LEFT", b, "RIGHT", 1, 0)
+    t:SetText(label)
+    b:SetScript("OnClick", function(self)
+        setFn(self:GetChecked() and true or false)
+        AfterSettingChange()
+    end)
+    b.refresh = function() b:SetChecked(getFn()) end
+    settingsControls[#settingsControls + 1] = b
+    return AddDesc(colX, y - 20, desc, DESC_INDENT) - 4
+end
+
+local function MakeRadio(colX, y, label, desc, selectedFn, onSelect)
+    local b = CreateFrame("CheckButton", nil, settings, "UIRadioButtonTemplate")
+    b:SetSize(16, 16)
+    b:SetPoint("TOPLEFT", colX + 3, y - 2)
+    local t = b:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    t:SetPoint("LEFT", b, "RIGHT", 4, 0)
+    t:SetText(label)
+    b:SetScript("OnClick", function()
+        onSelect()
+        AfterSettingChange()
+    end)
+    b.refresh = function() b:SetChecked(selectedFn()) end
+    settingsControls[#settingsControls + 1] = b
+    return AddDesc(colX, y - 18, desc, DESC_INDENT) - 4
+end
+
+local function MakeActionButton(colX, y, label, onClick)
+    local b = CreateFrame("Button", nil, settings, "UIPanelButtonTemplate")
+    b:SetSize(COLUMN_W, 22)
+    b:SetPoint("TOPLEFT", colX, y)
+    b:SetText(label)
+    b:SetScript("OnClick", onClick)
+    return b, y - 25
+end
+
+-- LEFT column: trade-window behavior, announcement tier, minimap -------------
+local ly = -46
+ly = SettingsHeader(LX, ly, "Trade Window", "Loot you can still trade away (2h).")
+ly = MakeCheck(LX, ly, "Enable trade timers", "Counts down the 2h window.",
+    function() local t = LootTrackerDB and LootTrackerDB.tradeTimers; return t and t.enabled end,
+    function(v) TT().enabled = v end)
+ly = MakeCheck(LX, ly, "Chat alert on expiry", "Warn in chat as time runs low.",
+    function() local t = LootTrackerDB and LootTrackerDB.tradeTimers; return t and t.alerts end,
+    function(v) TT().alerts = v end)
+ly = MakeCheck(LX, ly, "Show BoE items in panel", "BoE has no trade deadline.",
+    function() local t = LootTrackerDB and LootTrackerDB.tradeTimers; return (not t) or t.showBoE ~= false end,
+    function(v) TT().showBoE = v end)
+ly = MakeCheck(LX, ly, "Trade window only", "Hide the per-boss list.",
+    function() local t = LootTrackerDB and LootTrackerDB.tradeTimers; return t and t.panelOnly end,
+    function(v) TT().panelOnly = v end)
+-- "Scan bags now": recover already-tradeable drops sitting in the player's bags
+-- into the trade window (e.g. after a crash/relog where the entry was lost). The
+-- scan reads each item's real remaining trade time from its tooltip and never
+-- fabricates a deadline. Feedback is shown inline and echoed to chat.
+local scanStatusFS
+ly = select(2, MakeActionButton(LX, ly, "Scan bags now", function()
+    local scanned, updated = LT:ScanBagsForTradeWindow()
+    local msg = string.format("%d item%s scanned, %d updated on trade window.",
+        scanned, scanned == 1 and "" or "s", updated)
+    DEFAULT_CHAT_FRAME:AddMessage("|cffffd200LootTracker|r: " .. msg)
+    if scanStatusFS then scanStatusFS:SetText(msg) end
+    if Refresh then Refresh() end
+end))
+scanStatusFS = settings:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+scanStatusFS:SetPoint("TOPLEFT", LX, ly)
+scanStatusFS:SetWidth(COLUMN_W)
+scanStatusFS:SetJustifyH("LEFT")
+-- One-line hint (and the post-scan result line is also one line at this width),
+-- so a tight 14px slot keeps the left column inside the matched window height.
+scanStatusFS:SetText("Recover tradeable drops into the panel.")
+ly = ly - 14
+ly = ly - SEC_GAP
+
+ly = SettingsHeader(LX, ly, "Announce expiry for", "Min quality for chat alerts.")
+local QUALITY_TIERS = {
+    { label = "Uncommon and up", q = 2 },
+    { label = "Rare and up",     q = 3 },
+    { label = "Epic and up",     q = 4 },
+    { label = "Legendary only",  q = 5 },
+}
+for _, tier in ipairs(QUALITY_TIERS) do
+    local q = tier.q
+    ly = MakeRadio(LX, ly, tier.label, nil,
+        function() return ((LootTrackerDB and LootTrackerDB.tradeTimers
+            and LootTrackerDB.tradeTimers.alertMinQuality) or 3) == q end,
+        function() TT().alertMinQuality = q end)
+end
+ly = ly - SEC_GAP
+
+ly = SettingsHeader(LX, ly, "Minimap")
+ly = MakeCheck(LX, ly, "Show minimap button", "Launcher button on the minimap.",
+    function() return not (LootTrackerDB and LootTrackerDB.minimap and LootTrackerDB.minimap.hide) end,
+    function(v)
+        LootTrackerDB = LootTrackerDB or {}
+        LootTrackerDB.minimap = LootTrackerDB.minimap or {}
+        LootTrackerDB.minimap.hide = not v
+    end)
+
+-- RIGHT column: list display + data -----------------------------------------
+local ry = -46
+ry = SettingsHeader(RX, ry, "Distributed items", "After you mark one handed out:")
+ry = MakeRadio(RX, ry, "Keep with checkmark", "Stays, marked with a check.",
+    function() return (LootTrackerDB and LootTrackerDB.distributedMode or "check") == "check" end,
+    function() LootTrackerDB = LootTrackerDB or {}; LootTrackerDB.distributedMode = "check" end)
+ry = MakeRadio(RX, ry, "Remove from list", "Removed from the list.",
+    function() return LootTrackerDB and LootTrackerDB.distributedMode == "remove" end,
+    function() LootTrackerDB = LootTrackerDB or {}; LootTrackerDB.distributedMode = "remove" end)
+ry = ry - SEC_GAP
+
+ry = SettingsHeader(RX, ry, "Duplicate items", "When the same item drops twice:")
+ry = MakeRadio(RX, ry, "Separate rows", "One row per copy & its rolls.",
+    function() return (LootTrackerDB and LootTrackerDB.duplicateMode or "separate") == "separate" end,
+    function() LootTrackerDB = LootTrackerDB or {}; LootTrackerDB.duplicateMode = "separate" end)
+ry = MakeRadio(RX, ry, "Combine into xN", "Collapse copies to one row.",
+    function() return LootTrackerDB and LootTrackerDB.duplicateMode == "combined" end,
+    function() LootTrackerDB = LootTrackerDB or {}; LootTrackerDB.duplicateMode = "combined" end)
+ry = ry - SEC_GAP
+
+ry = SettingsHeader(RX, ry, "Data")
+local _
+_, ry = MakeActionButton(RX, ry, "Generate mock data", function()
+    LT:GenerateMockData()
+    if not frame:IsShown() then frame:Show() elseif Refresh then Refresh() end
+    RefreshSettings()  -- a session now exists; update the delete-current button
 end)
+local delCurrentBtn
+delCurrentBtn, ry = MakeActionButton(RX, ry, "Delete current session", function()
+    local s = GetDisplaySession()
+    if not s then return end
+    StaticPopup_Show("LOOTTRACKER_DELETE_SESSION_CONFIRM", FormatSessionLabel(s), nil, s.id)
+end)
+_, ry = MakeActionButton(RX, ry, "Delete all sessions", function()
+    StaticPopup_Show("LOOTTRACKER_DELETE_ALL_CONFIRM")
+end)
+-- The delete-current button is meaningless with no session; grey it out then.
+delCurrentBtn.refresh = function()
+    if GetDisplaySession() then delCurrentBtn:Enable() else delCurrentBtn:Disable() end
+end
+settingsControls[#settingsControls + 1] = delCurrentBtn
+
+local function ToggleSettings()
+    if settings:IsShown() then
+        settings:Hide()
+        return
+    end
+    -- Dock to the left of the main window when it's open (tops aligned). A small
+    -- positive overlap compensates for the dialog border insets so the two
+    -- frames look snug rather than separated. Otherwise open centered.
+    settings:ClearAllPoints()
+    if frame:IsShown() then
+        settings:SetPoint("TOPRIGHT", frame, "TOPLEFT", 8, 0)
+    else
+        settings:SetPoint("CENTER")
+    end
+    RefreshSettings()
+    settings:Show()
+end
+
+cogBtn:SetScript("OnClick", function() ToggleSettings() end)
+
+-- ---------------------------------------------------------------------------
+-- Minimap button
+--
+-- A hand-rolled launcher (no LibDBIcon dependency — the addon ships no embedded
+-- libraries). Left-click toggles the window, right-click opens the settings
+-- panel, and dragging repositions it around the minimap edge. The position is stored
+-- as an angle in LootTrackerDB.minimap.angle; "hide" removes it for users who
+-- launch via /lt.
+-- ---------------------------------------------------------------------------
+
+local MINIMAP_BTN_RADIUS = 80
+
+local minimapButton = CreateFrame("Button", "LootTrackerMinimapButton", Minimap)
+minimapButton:SetSize(31, 31)
+minimapButton:SetFrameStrata("MEDIUM")
+-- Sit above the minimap's own art/blips so the button can't be occluded.
+minimapButton:SetFrameLevel((Minimap:GetFrameLevel() or 1) + 8)
+minimapButton:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+minimapButton:RegisterForDrag("LeftButton")
+minimapButton:SetMovable(true)
+-- Anchor immediately with the default angle so the button is never a point-less
+-- (and therefore invisible) frame if the saved-angle refresh is delayed.
+-- UpdateMinimapButtonPosition re-applies the saved angle at AddonLoaded.
+minimapButton:SetPoint("CENTER", Minimap, "CENTER",
+    math.cos(math.rad(200)) * MINIMAP_BTN_RADIUS,
+    math.sin(math.rad(200)) * MINIMAP_BTN_RADIUS)
+minimapButton:Show()
+
+-- Loot-chest launcher icon. A built-in WoW icon is used (always loadable —
+-- unlike a shipped .tga, which the client won't read until a full restart, not
+-- just /reload), cropped to 0.08–0.92 to trim its square border so it sits
+-- cleanly inside the round button ring.
+local MINIMAP_ICON = "Interface\\Icons\\INV_Box_03"
+
+local minimapIcon = minimapButton:CreateTexture(nil, "BACKGROUND")
+minimapIcon:SetSize(20, 20)
+minimapIcon:SetPoint("CENTER", 0, 1)
+
+local function ApplyMinimapIcon()
+    minimapIcon:SetTexture(MINIMAP_ICON)
+    minimapIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+end
+ApplyMinimapIcon()
+
+-- Standard raised minimap-button ring drawn over the icon. The icon is cropped
+-- (above) to its inner art, so the ring overlaps its square edges cleanly.
+local minimapBorder = minimapButton:CreateTexture(nil, "OVERLAY")
+minimapBorder:SetSize(53, 53)
+minimapBorder:SetPoint("TOPLEFT")
+minimapBorder:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+
+local function UpdateMinimapButtonPosition()
+    local db = LootTrackerDB and LootTrackerDB.minimap
+    local angle = math.rad((db and db.angle) or 200)
+    minimapButton:SetPoint("CENTER", Minimap, "CENTER",
+        math.cos(angle) * MINIMAP_BTN_RADIUS,
+        math.sin(angle) * MINIMAP_BTN_RADIUS)
+end
+
+-- While dragging, derive the angle from the cursor position relative to the
+-- minimap center (the standard LibDBIcon approach) and persist it live.
+local function MinimapDragUpdate()
+    local mx, my = Minimap:GetCenter()
+    local scale = Minimap:GetEffectiveScale()
+    if not (mx and my and scale and scale > 0) then return end
+    local cx, cy = GetCursorPosition()
+    cx, cy = cx / scale, cy / scale
+    LootTrackerDB = LootTrackerDB or {}
+    LootTrackerDB.minimap = LootTrackerDB.minimap or {}
+    LootTrackerDB.minimap.angle = math.deg(math.atan2(cy - my, cx - mx))
+    UpdateMinimapButtonPosition()
+end
+
+minimapButton:SetScript("OnDragStart", function(self)
+    self:SetScript("OnUpdate", MinimapDragUpdate)
+end)
+minimapButton:SetScript("OnDragStop", function(self)
+    self:SetScript("OnUpdate", nil)
+end)
+
+minimapButton:SetScript("OnClick", function(self, button)
+    if button == "RightButton" then
+        ToggleSettings()
+    else
+        if frame:IsShown() then frame:Hide() else frame:Show() end
+    end
+end)
+
+minimapButton:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+    GameTooltip:SetText("Loot Tracker", 1, 1, 1)
+    GameTooltip:AddLine("Left-click: toggle window", 0.8, 0.8, 0.8)
+    GameTooltip:AddLine("Right-click: options", 0.8, 0.8, 0.8)
+    GameTooltip:AddLine("Drag: reposition", 0.8, 0.8, 0.8)
+    GameTooltip:Show()
+end)
+minimapButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+-- Assigned (not declared) — forward-declared near the top so the cog menu's
+-- "Hide minimap button" toggle (defined above) can call it.
+UpdateMinimapButton = function()
+    local db = LootTrackerDB and LootTrackerDB.minimap
+    if db and db.hide then
+        minimapButton:Hide()
+    else
+        UpdateMinimapButtonPosition()
+        minimapButton:Show()
+    end
+end
 
 -- Right-click context menu shared by Bosses-list item rows and Trade Window
 -- rows. A single dropdown frame is reused for every row (EasyMenu rebuilds the
@@ -987,15 +1405,27 @@ local itemContextMenuFrame = CreateFrame("Frame", "LootTrackerItemContextMenu", 
 
 -- Assigned (not declared) — forward-declared near the top so row OnClick
 -- closures defined earlier can call it.
-ShowItemContextMenu = function(item)
+ShowItemContextMenu = function(item, copies)
     if not item then return end
+    -- `copies` is the set the action applies to: a single item in separate mode,
+    -- or every grouped copy in combined mode. The menu label and check state
+    -- track the representative item.
+    copies = copies or { item }
     local name = (item.itemLink and item.itemLink:match("%[(.-)%]")) or "Item"
+    local count = #copies
+    local distLabel = item.distributed and "Unmark distributed" or "Mark as distributed"
+    if count > 1 then
+        distLabel = distLabel .. " (x" .. count .. ")"
+    end
     local menu = {
         { text = name, isTitle = true, notCheckable = true },
-        { text = item.distributed and "Unmark distributed" or "Mark as distributed",
+        { text = distLabel,
           notCheckable = true,
           func = function()
-              item.distributed = (not item.distributed) or nil
+              -- Toggle to the opposite of the representative's current state and
+              -- apply it uniformly to every copy in the group.
+              local newState = (not item.distributed) or nil
+              for _, c in ipairs(copies) do c.distributed = newState end
               -- Unmarking turns a static "distributed" row back into a live
               -- countdown, which needs the per-second ticker running. It may have
               -- self-stopped (e.g. this was the only in-window item and it was
@@ -1013,35 +1443,169 @@ end
 -- Layout + viewport-aware render
 -- ---------------------------------------------------------------------------
 
-local function ComputeLayout(session)
-    local removeMode = LootTrackerDB and LootTrackerDB.distributedMode == "remove"
-    local entries = {}
-    local y = PAD
-    for _, boss in ipairs(session.bosses) do
-        entries[#entries + 1] = { y = y, h = ROW_BOSS_HEADER, kind = "boss", data = boss }
-        y = y + ROW_BOSS_HEADER + 2
-        if not boss.collapsed then
-            for _, item in ipairs(boss.items) do
-                if not (removeMode and item.distributed) then
-                    entries[#entries + 1] = { y = y, h = ROW_ITEM, kind = "item", data = item }
-                    y = y + ROW_ITEM
-                    if item.expanded then
-                        if #item.rolls == 0 then
-                            entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "empty", data = item }
-                            y = y + ROW_ROLL
-                        else
-                            for _, roll in ipairs(item.rolls) do
-                                entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "roll",
-                                    data = roll, parentItem = item }
-                                y = y + ROW_ROLL
-                            end
-                        end
-                    end
+-- True when `item` passes the active search filter. Matches the query against
+-- the item name, the recipient/winner, and every roller's name (case-insensitive
+-- substring). Empty query matches everything.
+local function ItemMatchesSearch(item, q)
+    if not q or q == "" then return true end
+    local name = item.itemLink and item.itemLink:match("%[(.-)%]")
+    if name and name:lower():find(q, 1, true) then return true end
+    if item.recipient and item.recipient:lower():find(q, 1, true) then return true end
+    if item.rolls then
+        for _, r in ipairs(item.rolls) do
+            if r.player and r.player:lower():find(q, 1, true) then return true end
+        end
+    end
+    return false
+end
+
+-- Group item entries by itemId, preserving first-seen order. Each group carries
+-- the representative entry (first copy), the full copy list (so actions like
+-- "mark distributed" can fan out to every copy), the summed count, and the
+-- concatenation of every copy's rolls (re-sorted high-to-low). Used by the
+-- Bosses-list combined view and the trade panel.
+local function GroupByItemId(items)
+    local groups, order = {}, {}
+    for _, item in ipairs(items) do
+        local g = groups[item.itemId]
+        if not g then
+            g = { rep = item, copies = {}, count = 0, rolls = {} }
+            groups[item.itemId] = g
+            order[#order + 1] = item.itemId
+        end
+        g.copies[#g.copies + 1] = item
+        g.count = g.count + (item.count or 1)
+        for _, r in ipairs(item.rolls or {}) do g.rolls[#g.rolls + 1] = r end
+    end
+    local result = {}
+    for _, id in ipairs(order) do
+        local g = groups[id]
+        table.sort(g.rolls, function(a, b) return (a.value or 0) > (b.value or 0) end)
+        result[#result + 1] = g
+    end
+    return result
+end
+
+-- Build the display label for an item: link + optional "xN" count + optional
+-- BoE tag. `countOverride` lets combined rows show the group's summed count.
+local function BuildItemLabel(item, countOverride)
+    local label = item.itemLink or "?"
+    local cnt = countOverride or item.count
+    if cnt and cnt > 1 then
+        label = label .. "  |cffaaaaaax" .. cnt .. "|r"
+    end
+    if item.itemId and LT:GetItemBoE(item.itemId) then
+        label = label .. BOE_TAG
+    end
+    return label
+end
+
+-- Build display units from a flat item list: one unit per copy (separate) or one
+-- per itemId group (combined). A unit is { item, count, copies, rolls }.
+local function BuildUnits(items, combined)
+    local units = {}
+    if combined then
+        for _, g in ipairs(GroupByItemId(items)) do
+            units[#units + 1] = { item = g.rep, count = g.count, copies = g.copies, rolls = g.rolls }
+        end
+    else
+        for _, item in ipairs(items) do
+            units[#units + 1] = { item = item, count = item.count, copies = { item }, rolls = item.rolls }
+        end
+    end
+    return units
+end
+
+-- Append one "item" entry per unit (plus its roll/empty sub-entries when the
+-- unit is expanded or a search is active) to `entries`, laying out from `y`.
+-- Shared by the per-boss layout and the flat trade layout. Returns the new y.
+local function EmitItemUnits(entries, y, units, searching)
+    for _, u in ipairs(units) do
+        entries[#entries + 1] = { y = y, h = ROW_ITEM, kind = "item",
+            data = u.item, displayCount = u.count, copies = u.copies }
+        y = y + ROW_ITEM
+        -- Force-expand while searching so a player-name match reveals the rolls.
+        if u.item.expanded or searching then
+            if #u.rolls == 0 then
+                entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "empty", data = u.item }
+                y = y + ROW_ROLL
+            else
+                for _, roll in ipairs(u.rolls) do
+                    entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "roll",
+                        data = roll, parentItem = u.item }
+                    y = y + ROW_ROLL
                 end
             end
         end
-        y = y + 4
     end
+    return y
+end
+
+local function ComputeLayout(session)
+    local removeMode = LootTrackerDB and LootTrackerDB.distributedMode == "remove"
+    local combined   = LootTrackerDB and LootTrackerDB.duplicateMode == "combined"
+    local q = searchQuery
+    local searching = q ~= nil and q ~= ""
+    local entries = {}
+    local y = PAD
+    for _, boss in ipairs(session.bosses) do
+        -- Items surviving the distributed-remove and search filters.
+        local visible = {}
+        for _, item in ipairs(boss.items) do
+            if not (removeMode and item.distributed)
+                and ItemMatchesSearch(item, q)
+            then
+                visible[#visible + 1] = item
+            end
+        end
+        -- A real killed boss (has an npcId) is shown even with no surviving items,
+        -- so the kill itself is logged — many bosses drop only grey/white loot
+        -- (dropped by the quality gate) yet you still want to see you cleared them.
+        -- Suppressed while searching (an empty boss can't match a query) and never
+        -- for the Trash bucket (npcId = nil), which is meaningless when empty.
+        local showEmpty = boss.npcId ~= nil and not searching
+        if #visible > 0 or showEmpty then
+            entries[#entries + 1] = { y = y, h = ROW_BOSS_HEADER, kind = "boss", data = boss }
+            y = y + ROW_BOSS_HEADER + 2
+            -- A search reveals matches even under a collapsed boss.
+            local collapsed = boss.collapsed and not searching
+            if not collapsed then
+                if #visible > 0 then
+                    y = EmitItemUnits(entries, y, BuildUnits(visible, combined), searching)
+                elseif #boss.items == 0 then
+                    -- Killed boss that dropped nothing trackable (only grey/white,
+                    -- discarded by the quality gate): a placeholder line so the empty
+                    -- header doesn't read as a bug. NOT shown when the boss did drop
+                    -- items that are merely hidden by the distributed-remove filter.
+                    entries[#entries + 1] = { y = y, h = ROW_ROLL, kind = "noloot" }
+                    y = y + ROW_ROLL
+                end
+            end
+            y = y + 4
+        end
+    end
+    return entries, y + PAD
+end
+
+-- Flat, expandable layout for "trade window only" mode: every item with a live
+-- trade window (soonest-expiring first, via GetActiveTradeTimers), with no boss
+-- headers. Each item renders through the normal item row (so it keeps its
+-- countdown badge) and expands to the player rolls. Honors the search filter and
+-- the combined-duplicates mode; rows are collapsed by default.
+local function ComputeTradeLayout(session)
+    local q = searchQuery
+    local searching = q ~= nil and q ~= ""
+    local combined = LootTrackerDB and LootTrackerDB.duplicateMode == "combined"
+
+    local picked = {}
+    for _, info in ipairs(LT:GetActiveTradeTimers(session)) do
+        if ItemMatchesSearch(info.item, q) then
+            picked[#picked + 1] = info.item
+        end
+    end
+
+    local entries = {}
+    local y = EmitItemUnits(entries, PAD, BuildUnits(picked, combined), searching)
     return entries, y + PAD
 end
 
@@ -1054,11 +1618,7 @@ local function MeasureItemLabel(item)
         measureFS = UIParent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         measureFS:Hide()
     end
-    local label = item.itemLink or "?"
-    if item.count and item.count > 1 then
-        label = label .. "  |cffaaaaaax" .. item.count .. "|r"
-    end
-    measureFS:SetText(label)
+    measureFS:SetText(BuildItemLabel(item))
     return measureFS:GetStringWidth() or 0
 end
 
@@ -1068,6 +1628,10 @@ end
 -- So frame width needed = nameWidth + 56 + 38 = nameWidth + 94
 local ROW_NAME_CHROME = 94
 
+local function WidthForMaxLabel(maxW)
+    return math.min(math.max(maxW + ROW_NAME_CHROME, FRAME_WIDTH_MIN), FRAME_WIDTH_MAX)
+end
+
 local function ComputeAutoWidth(session)
     local maxW = 0
     for _, boss in ipairs(session.bosses) do
@@ -1076,7 +1640,21 @@ local function ComputeAutoWidth(session)
             if w > maxW then maxW = w end
         end
     end
-    return math.min(math.max(maxW + ROW_NAME_CHROME, FRAME_WIDTH_MIN), FRAME_WIDTH_MAX)
+    return WidthForMaxLabel(maxW)
+end
+
+-- Width sized to just the item rows in `layout` (its "item" entries) — used in
+-- trade-window-only mode so the frame fits the displayed trades, not every
+-- recorded boss drop.
+local function ComputeAutoWidthForLayout(layout)
+    local maxW = 0
+    for _, e in ipairs(layout) do
+        if e.kind == "item" then
+            local w = MeasureItemLabel(e.data)
+            if w > maxW then maxW = w end
+        end
+    end
+    return WidthForMaxLabel(maxW)
 end
 
 local function RenderBossHeaderAt(boss, width, y)
@@ -1090,17 +1668,17 @@ local function RenderBossHeaderAt(boss, width, y)
     hdr:Show()
 end
 
-local function RenderItemRowAt(item, width, y)
+local function RenderItemRowAt(item, width, y, displayCount, copies)
     local row = Acquire(itemRowPool, MakeItemRow)
     row:SetWidth(width)
     row:SetPoint("TOPLEFT", 0, -y)
     row.item = item
+    -- In combined mode `copies` holds every grouped copy so the context menu's
+    -- "mark distributed" fans out to all of them; in separate mode it's the
+    -- single item.
+    row.copies = copies or { item }
     row.itemLink = item.itemLink
-    local label = item.itemLink or "?"
-    if item.count and item.count > 1 then
-        label = label .. "  |cffaaaaaax" .. item.count .. "|r"
-    end
-    row.nameText:SetText(label)
+    row.nameText:SetText(BuildItemLabel(item, displayCount))
     SetItemIcon(row.icon, item.itemId)
     -- Restore the expand caret + standard icon anchor in case this row was
     -- previously rendered as an aggregate-tab row (which hides expand and
@@ -1199,6 +1777,28 @@ local function RenderEmptyRollRowAt(width, y)
     rr.equipped.itemLink = nil
     rr.nameText:ClearAllPoints()
     rr.nameText:SetPoint("LEFT", rr.classIcon, "RIGHT", 4, 0)
+    rr.nameText:SetPoint("RIGHT", -4, 0)
+    rr:Show()
+end
+
+-- Placeholder row under a killed boss that dropped nothing trackable, so an empty
+-- boss header isn't mistaken for a bug. Reuses the thin roll-row frame, greyed,
+-- with no dice / class icon.
+local function RenderNoLootRowAt(width, y)
+    local rr = Acquire(rollRowPool, MakeRollRow)
+    rr:SetWidth(width)
+    rr:SetPoint("TOPLEFT", 0, -y)
+    rr.rollText:SetText("")
+    rr.dice:SetTexture(nil)
+    rr.classIcon:SetTexture(nil)
+    rr.equipped:Hide()
+    rr.equipped.itemLink = nil
+    -- Left-aligned, dimmed sub-line under the boss header so an empty boss reads as
+    -- "cleared, no drop" rather than a stray row. (nameText justify is LEFT from
+    -- MakeRollRow and nothing flips it, so no SetJustifyH needed here.)
+    rr.nameText:SetText("|cff707070Nothing dropped from this boss|r")
+    rr.nameText:ClearAllPoints()
+    rr.nameText:SetPoint("LEFT", 12, 0)
     rr.nameText:SetPoint("RIGHT", -4, 0)
     rr:Show()
 end
@@ -1320,80 +1920,187 @@ local function ResolveAggregateLink(entry, itemId)
     return entry.itemLink
 end
 
--- Render one row per aggregated item in `bucket` (session.currencies or
--- session.materials). The row reuses the existing item-row pool/widget but
--- with `row.item = nil`, which makes its OnClick a no-op (no expand/collapse).
--- Tooltips and shift-clicking still work because itemLink is populated.
--- Returns the total content height in pixels for the caller to apply.
-local function RenderAggregateTab(bucket, emptyText)
-    if not bucket or not next(bucket) then
+-- Per-player collapse state for the Currencies / Materials tabs, keyed by
+-- player name. An absent entry means "use the default" (expanded for yourself,
+-- collapsed for everyone else); a stored boolean is the user's explicit toggle.
+-- In-memory only — resets to defaults on /reload, which is fine for what is
+-- purely a cosmetic grouping (boss collapse persists because it lives on the
+-- session data; this does not).
+local currencyCollapsed, materialCollapsed = {}, {}
+
+-- Indent for child rows (gold + item) under a player header, so the grouping
+-- reads as a hierarchy the way boss-tab item rows sit under their boss header.
+local AGG_ROW_ICON_INDENT = 12
+
+-- Render the per-session looted-money total as a single non-interactive row
+-- under your own player group on the Currencies tab. Money has no itemId/
+-- itemLink, so it bypasses SetItemIcon's async ticker and ResolveAggregateLink:
+-- a fixed coin icon plus the client's own GetCoinTextureString (inline g/s/c
+-- coin glyphs). Mirrors the per-row reset the item loop does so a row recycled
+-- from a Bosses-tab render carries no leftover check/expand/timer state.
+-- Returns the next y offset.
+local GOLD_ROW_ICON = "Interface\\Icons\\INV_Misc_Coin_01"
+local function RenderGoldRow(y, width, copper)
+    local row = Acquire(itemRowPool, MakeItemRow)
+    row:SetWidth(width)
+    row:SetPoint("TOPLEFT", 0, -y)
+    row.item     = nil
+    row.itemLink = nil          -- money has no tooltip / shift-link target
+    row.check:Hide()
+    row.expand:Hide()
+    row.icon:SetDesaturated(false)
+    row.icon:ClearAllPoints()
+    row.icon:SetPoint("LEFT", AGG_ROW_ICON_INDENT, 0)
+    SetItemIcon(row.icon, nil)          -- drop any stale icon-ticker queue entry...
+    row.icon:SetTexture(GOLD_ROW_ICON)  -- ...then pin the coin icon
+    if row.timerFrame then
+        if row.timerFrame.pulseStarted then
+            row.timerFrame:SetScript("OnUpdate", nil)
+            row.timerFrame.pulseStarted = false
+        end
+        row.timerFrame:Hide()
+    end
+    local coinText = (GetCoinTextureString and GetCoinTextureString(copper)) or (copper .. "c")
+    row.nameText:SetText("|cffffd700Gold|r  " .. coinText)
+    row:Show()
+    return y + ROW_ITEM
+end
+
+-- Render one aggregated item row (icon + link + "xN") under a player group.
+-- `rec` is { entry = <bucket entry>, itemId, count } where `count` is THIS
+-- player's tally of the item. Inert like the gold row: row.item=nil makes
+-- OnClick a no-op, but the itemLink is set so tooltip + shift-link still work.
+-- Returns the next y offset.
+local function RenderAggregateItemRow(rec, width, y)
+    local row = Acquire(itemRowPool, MakeItemRow)
+    row:SetWidth(width)
+    row:SetPoint("TOPLEFT", 0, -y)
+    row.item = nil
+    SetItemIcon(row.icon, rec.itemId)
+    -- Aggregate rows never carry distributed state; clear the marker the shared
+    -- item-row pool may have left behind from a Bosses-tab render.
+    row.check:Hide()
+    row.icon:SetDesaturated(false)
+    row.timerIcon:Show()
+    local itemLink = ResolveAggregateLink(rec.entry, rec.itemId)
+    row.itemLink = itemLink
+    row.expand:Hide()
+    row.icon:ClearAllPoints()
+    row.icon:SetPoint("LEFT", AGG_ROW_ICON_INDENT, 0)
+    if row.timerFrame then
+        if row.timerFrame.pulseStarted then
+            row.timerFrame:SetScript("OnUpdate", nil)
+            row.timerFrame.pulseStarted = false
+        end
+        row.timerFrame:Hide()
+    end
+    row.nameText:SetText((itemLink or "?") .. "  |cffaaaaaax" .. rec.count .. "|r")
+    row:Show()
+    return y + ROW_ITEM
+end
+
+-- Render one player group header: expand caret + class-colored name on the
+-- left, class icon on the right (the per-player analogue of the boss header's
+-- timestamp). Returns the next y offset.
+local function RenderPlayerHeader(name, isSelf, collapsed, collapsedTable, width, y)
+    local hdr = Acquire(playerHeaderPool, MakePlayerHeader)
+    hdr:SetWidth(width)
+    hdr:SetPoint("TOPLEFT", 0, -y)
+    hdr.player         = name
+    hdr.collapsedTable = collapsedTable
+    hdr.isCollapsed    = collapsed
+
+    local class = LT:GetPlayerClass(name)
+    local label = DisplayName(name)
+    if isSelf then label = label .. " |cff888888(you)|r" end
+    hdr.text:SetText("|c" .. ClassColorString(class) .. label .. "|r")
+
+    local coords = class and CLASS_COORDS[class]
+    if coords then
+        hdr.classIcon:SetTexture(CLASS_TEX)
+        hdr.classIcon:SetTexCoord(coords[1], coords[2], coords[3], coords[4])
+        hdr.classIcon:Show()
+    else
+        hdr.classIcon:Hide()
+    end
+
+    hdr.expand:SetTexture(collapsed and PLUS_TEX or MINUS_TEX)
+    hdr:Show()
+    return y + ROW_BOSS_HEADER
+end
+
+-- Player-grouped view for the Currencies / Materials tabs, modeled on the
+-- Bosses tab: each recipient is an expandable group (name left, class icon
+-- right) whose child rows are that player's aggregated items. Yourself is
+-- pinned to the top and expanded by default; everyone else is alphabetical and
+-- collapsed by default (overridable per player via `collapsedTable`).
+-- `moneyCopper` (Currencies tab only) adds a looted-gold row under your own
+-- group. Returns the total content height in pixels for the caller to apply.
+local function RenderPlayerGroupedTab(bucket, emptyText, collapsedTable, moneyCopper)
+    local selfName = UnitName("player")
+    local hasMoney = moneyCopper and moneyCopper > 0
+
+    -- Pivot bucket -> per-player item lists. Each item carries a reference to
+    -- the real bucket entry so ResolveAggregateLink can still cache its healed
+    -- link back onto persistent storage.
+    local players = {}
+    local function ensure(playerName)
+        local p = players[playerName]
+        if not p then p = { items = {} }; players[playerName] = p end
+        return p
+    end
+    if bucket then
+        for itemId, entry in pairs(bucket) do
+            for playerName, cnt in pairs(entry.recipients) do
+                local p = ensure(playerName)
+                p.items[#p.items + 1] = { entry = entry, itemId = itemId, count = cnt }
+            end
+        end
+    end
+    -- Gold is self-only data, so it forces (and lives under) your own group.
+    if hasMoney then ensure(selfName) end
+
+    if not next(players) then
         ShowPlaceholderTabLabel(emptyText)
         return 120
     end
     HidePlaceholderTabLabel()
 
-    -- Stable ordering: descending count, then ascending itemId for ties.
-    local ordered = {}
-    for itemId, entry in pairs(bucket) do
-        ordered[#ordered + 1] = { itemId = itemId, entry = entry }
+    -- Order: self first, then everyone else alphabetically (case-insensitive).
+    local order = {}
+    for playerName in pairs(players) do
+        if playerName ~= selfName then order[#order + 1] = playerName end
     end
-    table.sort(ordered, function(a, b)
-        if a.entry.count ~= b.entry.count then
-            return a.entry.count > b.entry.count
-        end
-        return a.itemId < b.itemId
-    end)
+    table.sort(order, function(a, b) return a:lower() < b:lower() end)
+    if players[selfName] then table.insert(order, 1, selfName) end
 
     local width = GetContentWidth()
-
     local y = PAD
-    for _, rec in ipairs(ordered) do
-        local row = Acquire(itemRowPool, MakeItemRow)
-        row:SetWidth(width)
-        row:SetPoint("TOPLEFT", 0, -y)
-        row.item     = nil
-        SetItemIcon(row.icon, rec.itemId)
-        -- Aggregate rows never carry distributed state; clear the marker the
-        -- shared item-row pool may have left behind from a Bosses-tab render.
-        row.check:Hide()
-        row.icon:SetDesaturated(false)
-        row.timerIcon:Show()
-        local itemLink = ResolveAggregateLink(rec.entry, rec.itemId)
-        row.itemLink = itemLink
-        row.expand:Hide()
-        row.icon:ClearAllPoints()
-        row.icon:SetPoint("LEFT", 4, 0)
-        if row.timerFrame then
-            if row.timerFrame.pulseStarted then
-                row.timerFrame:SetScript("OnUpdate", nil)
-                row.timerFrame.pulseStarted = false
+    for _, playerName in ipairs(order) do
+        local p = players[playerName]
+        local isSelf = (playerName == selfName)
+        -- Default collapsed for everyone but yourself; an explicit toggle wins.
+        local collapsed = collapsedTable[playerName]
+        if collapsed == nil then collapsed = not isSelf end
+
+        y = RenderPlayerHeader(playerName, isSelf, collapsed, collapsedTable, width, y)
+        y = y + 2
+
+        if not collapsed then
+            if isSelf and hasMoney then
+                y = RenderGoldRow(y, width, moneyCopper)
             end
-            row.timerFrame:Hide()
+            -- Stable ordering: descending count, then ascending itemId for ties.
+            table.sort(p.items, function(a, b)
+                if a.count ~= b.count then return a.count > b.count end
+                return (a.itemId or 0) < (b.itemId or 0)
+            end)
+            for _, rec in ipairs(p.items) do
+                y = RenderAggregateItemRow(rec, width, y)
+            end
         end
-
-        -- Sort recipients by descending count for the parenthetical breakdown.
-        local rNames = {}
-        for name, count in pairs(rec.entry.recipients) do
-            rNames[#rNames + 1] = { name = name, count = count }
-        end
-        table.sort(rNames, function(a, b) return a.count > b.count end)
-        local rText = ""
-        for i, r in ipairs(rNames) do
-            if i > 1 then rText = rText .. ", " end
-            local class = LT:GetPlayerClass(r.name)
-            rText = rText .. "|c" .. ClassColorString(class) .. DisplayName(r.name) .. "|r x" .. r.count
-        end
-        local recipientPart = (rText ~= "") and ("  (" .. rText .. ")") or ""
-
-        local label = (itemLink or "?")
-            .. "  |cffaaaaaax" .. rec.entry.count .. "|r"
-            .. recipientPart
-        row.nameText:SetText(label)
-        row:Show()
-
-        y = y + ROW_ITEM
+        y = y + 4
     end
-
     return y + PAD
 end
 
@@ -1415,7 +2122,11 @@ local function RenderTradePanel(session)
     local timers = session and LT:GetActiveTradeTimers(session) or {}
     local enabled = LootTrackerDB and LootTrackerDB.tradeTimers
         and LootTrackerDB.tradeTimers.enabled
-    if not enabled or activeTab ~= TAB_BOSSES or #timers == 0 then
+    -- In "trade window only" mode the trade list takes over the main scroll area
+    -- (see ComputeTradeLayout), so the sticky panel is redundant and hidden.
+    local panelOnly = LootTrackerDB and LootTrackerDB.tradeTimers
+        and LootTrackerDB.tradeTimers.panelOnly
+    if not enabled or activeTab ~= TAB_BOSSES or panelOnly or #timers == 0 then
         tradePanel:Hide()
         tradeScroll:Hide()
         ReleaseTradeRowsFrom(1)
@@ -1436,12 +2147,42 @@ local function RenderTradePanel(session)
     for _, info in ipairs(timers) do
         local status = LT:GetTradeTimerStatus(info.item)
         if status then
-            eligible[#eligible + 1] = { item = info.item, status = status }
+            eligible[#eligible + 1] = { item = info.item, status = status,
+                count = info.item.count or 1, copies = { info.item } }
         end
     end
-    local count = #eligible
 
-    if count == 0 then
+    -- Combined mode: collapse same-itemId rows into one, summing the counts and
+    -- keeping the soonest-expiring copy as the representative timer (the most
+    -- urgent reminder). `copies` lets a right-click "mark distributed" settle
+    -- every copy in the group at once.
+    if LootTrackerDB and LootTrackerDB.duplicateMode == "combined" then
+        local groups, order = {}, {}
+        for _, e in ipairs(eligible) do
+            local id = e.item.itemId
+            local g = groups[id]
+            if not g then
+                g = { item = e.item, status = e.status, count = 0, copies = {} }
+                groups[id] = g
+                order[#order + 1] = id
+            end
+            g.count = g.count + (e.item.count or 1)
+            g.copies[#g.copies + 1] = e.item
+            if e.status.remainingSec < g.status.remainingSec then
+                g.item   = e.item
+                g.status = e.status
+            end
+        end
+        local merged = {}
+        for _, id in ipairs(order) do merged[#merged + 1] = groups[id] end
+        eligible = merged
+    end
+
+    local rowCount = #eligible
+    local totalItems = 0
+    for _, e in ipairs(eligible) do totalItems = totalItems + (e.count or 1) end
+
+    if rowCount == 0 then
         -- Every item in `timers` flipped past expiry between the initial scan
         -- and this recheck (extreme edge case). Hide the panel entirely rather
         -- than show an empty body or a misleading header count.
@@ -1453,7 +2194,7 @@ local function RenderTradePanel(session)
 
     tradePanelTitle:SetText(string.format(
         "|cffffd200Trade Window (%d %s)|r",
-        count, (count == 1) and "item" or "items"))
+        totalItems, (totalItems == 1) and "item" or "items"))
 
     if collapsed then
         ReleaseTradeRowsFrom(1)
@@ -1472,6 +2213,7 @@ local function RenderTradePanel(session)
         r:SetPoint("TOPLEFT", 0, -y)
         r:SetPoint("TOPRIGHT", 0, -y)
         r.item         = e.item
+        r.copies       = e.copies
         r.itemLink     = e.item.itemLink
         r.droppedAt    = e.item.droppedAt
         r.remainingSec = e.status.remainingSec
@@ -1488,11 +2230,13 @@ local function RenderTradePanel(session)
             r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
             r.timer:SetText(string.format("|cff%s%s|r", e.status.color, e.status.text))
         end
-        r.nameText:SetText(e.item.itemLink or "?")
+        -- BuildItemLabel adds the "xN" count (combined groups) and BoE tag; the
+        -- per-copy count fix means a duplicate is never silently hidden here.
+        r.nameText:SetText(BuildItemLabel(e.item, e.count))
         r:Show()
         y = y + STICKY_PANEL_ROW_H
     end
-    ReleaseTradeRowsFrom(count + 1)
+    ReleaseTradeRowsFrom(rowCount + 1)
 
     -- Clamp the visible viewport to STICKY_PANEL_MAX_ROWS; the rest scrolls.
     local fullH     = y
@@ -1526,34 +2270,60 @@ local function RenderTradePanel(session)
     return STICKY_PANEL_HEADER_H + viewportH + STICKY_PANEL_GAP_BOT
 end
 
--- Re-anchor the scroll viewport based on the sticky panel's current height.
--- The panel itself is anchored once at construction time and only changes
--- its height; here we only need to push the scroll's TOPLEFT down by the
--- panel's current outer height so the two don't overlap.
-local function PositionScroll(stickyH)
+-- Place the search box (Bosses tab only) and re-anchor the sticky trade panel
+-- below it. Returns the content-area top offset (positive px from the frame
+-- top) that the scroll viewport must clear. The search row is shown only on the
+-- Bosses tab when there is something to search; otherwise the panel/scroll use
+-- the original top.
+local function PositionContentArea(session)
+    local searchShown = activeTab == TAB_BOSSES and session and #session.bosses > 0
+    if searchShown then
+        searchBox:ClearAllPoints()
+        searchBox:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + 16, -96)
+        searchBox:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -34, -96)
+        searchBox:Show()
+        UpdateSearchChrome()
+    else
+        searchBox:Hide()
+    end
+    local baseTop = 94 + (searchShown and SEARCH_ROW_H or 0)
+    tradePanel:ClearAllPoints()
+    tradePanel:SetPoint("TOPLEFT", PAD, -baseTop)
+    tradePanel:SetPoint("TOPRIGHT", -28, -baseTop)
+    return baseTop
+end
+
+-- Re-anchor the scroll viewport below the search row + sticky panel. `baseTop`
+-- is the content-area top from PositionContentArea; `stickyH` the trade panel's
+-- current outer height.
+local function PositionScroll(baseTop, stickyH)
     scroll:ClearAllPoints()
-    scroll:SetPoint("TOPLEFT", PAD, -94 - stickyH)
+    scroll:SetPoint("TOPLEFT", PAD, -baseTop - stickyH)
     scroll:SetPoint("BOTTOMRIGHT", -28, PAD + 2)
 end
 
 Refresh = function(reason)
     if not frame:IsShown() then return end
 
-    -- "scroll" and "timer" reuse the cached layout: neither changes item
-    -- geometry (scrolling moves the viewport; a timer tick only updates badge
-    -- text + drops expired trade rows). Forcing ComputeLayout/ComputeAutoWidth
-    -- on every 1s tick would be wasted work — the visible rows still re-render
-    -- below from layoutCache, so inline timer badges update either way.
-    if reason ~= "scroll" and reason ~= "timer" then layoutDirty = true end
+    local panelOnly = LootTrackerDB and LootTrackerDB.tradeTimers
+        and LootTrackerDB.tradeTimers.panelOnly
+
+    -- "scroll" and "timer" reuse the cached layout: scrolling only moves the
+    -- viewport, and a normal-mode timer tick only updates inline badge text. In
+    -- trade-window-only mode, though, an expired item must leave the flat list,
+    -- so a timer tick has to rebuild the layout there.
+    if reason ~= "scroll" and (reason ~= "timer" or panelOnly) then layoutDirty = true end
 
     ReleaseAll()
     local session = GetDisplaySession()
 
+    local baseTop = PositionContentArea(session)
     local stickyH = RenderTradePanel(session)
-    PositionScroll(stickyH)
+    PositionScroll(baseTop, stickyH)
 
     if not session then
         HidePlaceholderTabLabel()
+        emptyLabel:SetText(EMPTY_DEFAULT_TEXT)
         emptyLabel:Show()
         content:SetHeight(120)
         layoutDirty = true
@@ -1563,17 +2333,25 @@ Refresh = function(reason)
     if activeTab == TAB_BOSSES then
         HidePlaceholderTabLabel()
         if #session.bosses == 0 then
+            emptyLabel:SetText(EMPTY_DEFAULT_TEXT)
             emptyLabel:Show()
             content:SetHeight(120)
             layoutDirty = true
             return
         end
-        emptyLabel:Hide()
 
         if layoutDirty then
-            layoutCache, layoutTotalH = ComputeLayout(session)
+            -- "Trade window only" mode swaps the per-boss layout for the flat
+            -- trade list; both produce the same entry kinds, so the render loop
+            -- below is shared.
+            if panelOnly then
+                layoutCache, layoutTotalH = ComputeTradeLayout(session)
+            else
+                layoutCache, layoutTotalH = ComputeLayout(session)
+            end
             layoutDirty = false
-            local target = ComputeAutoWidth(session)
+            local target = panelOnly and ComputeAutoWidthForLayout(layoutCache)
+                or ComputeAutoWidth(session)
             if math.abs(frame:GetWidth() - target) > 0.5 then
                 frame:SetWidth(target)
                 -- Sync content width inline. scroll's OnSizeChanged fires deferred,
@@ -1582,6 +2360,23 @@ Refresh = function(reason)
             end
             SetDropdownWidth(math.max(target - 60, 150))
         end
+
+        -- Empty layout: distinguish "nothing matched the search" from "nothing to
+        -- show", and the trade-only mode from the normal per-boss list.
+        if not layoutCache or #layoutCache == 0 then
+            local searching = searchQuery ~= nil and searchQuery ~= ""
+            if panelOnly then
+                emptyLabel:SetText(searching and "No trades match your search."
+                    or "No items in the trade window.")
+            else
+                emptyLabel:SetText(searching and "No loot matches your search."
+                    or EMPTY_DEFAULT_TEXT)
+            end
+            emptyLabel:Show()
+            content:SetHeight(120)
+            return
+        end
+        emptyLabel:Hide()
         content:SetHeight(math.max(layoutTotalH, 1))
 
         local width = GetContentWidth()
@@ -1596,8 +2391,9 @@ Refresh = function(reason)
         for _, e in ipairs(layoutCache) do
             if e.y + e.h >= topY and e.y <= botY then
                 if e.kind == "boss"  then RenderBossHeaderAt(e.data, width, e.y)
-                elseif e.kind == "item"  then RenderItemRowAt(e.data, width, e.y)
+                elseif e.kind == "item"  then RenderItemRowAt(e.data, width, e.y, e.displayCount, e.copies)
                 elseif e.kind == "empty" then RenderEmptyRollRowAt(width, e.y)
+                elseif e.kind == "noloot" then RenderNoLootRowAt(width, e.y)
                 elseif e.kind == "roll"  then RenderRollRowAt(e.data, width, e.y, e.parentItem)
                 end
             end
@@ -1605,13 +2401,15 @@ Refresh = function(reason)
     elseif activeTab == TAB_CURRENCIES then
         emptyLabel:Hide()
         ResetFrameWidthToMin()
-        local h = RenderAggregateTab(session.currencies, "No currencies this session.")
+        local h = RenderPlayerGroupedTab(session.currencies, "No currencies this session.",
+            currencyCollapsed, session.money)
         content:SetHeight(math.max(h, 1))
         layoutDirty = true
     elseif activeTab == TAB_MATERIALS then
         emptyLabel:Hide()
         ResetFrameWidthToMin()
-        local h = RenderAggregateTab(session.materials, "No materials this session.")
+        local h = RenderPlayerGroupedTab(session.materials, "No materials this session.",
+            materialCollapsed)
         content:SetHeight(math.max(h, 1))
         layoutDirty = true
     end
@@ -1632,6 +2430,7 @@ LT:On("AddonLoaded", function()
         frame:SetPoint(unpack(LootTrackerDB.framePoint))
     end
     UpdateDropdownText()
+    if UpdateMinimapButton then UpdateMinimapButton() end
     Refresh()
 end)
 
@@ -1645,6 +2444,7 @@ LT:On("ItemReceived",      OnDataChanged)
 LT:On("RollAdded",         OnDataChanged)
 LT:On("CurrencyReceived",  OnDataChanged)
 LT:On("MaterialReceived",  OnDataChanged)
+LT:On("MoneyReceived",     OnDataChanged)
 -- Timer ticks fire every second once any trade window is live. They only
 -- affect countdown text and expired-row removal, not the session list or item
 -- geometry, so refresh with the layout-preserving "timer" reason and skip the
@@ -1686,6 +2486,12 @@ SlashCmdList["LOOTTRACKER"] = function(msg)
         frame:Hide()
     elseif cmd == "reset" then
         LT:Reset()
+    elseif cmd == "scanbag" then
+        local scanned, updated = LT:ScanBagsForTradeWindow()
+        DEFAULT_CHAT_FRAME:AddMessage(string.format(
+            "|cffffd200LootTracker|r: %d item%s scanned, %d updated on trade window.",
+            scanned, scanned == 1 and "" or "s", updated))
+        if Refresh then Refresh() end
     elseif cmd == "mock" then
         LT:GenerateMockData()
         if not frame:IsShown() then frame:Show() else Refresh() end
@@ -1715,7 +2521,17 @@ SlashCmdList["LOOTTRACKER"] = function(msg)
             DEFAULT_CHAT_FRAME:AddMessage("|cffffd200LootTracker|r: cleared "
                 .. n .. " debug log lines.")
         end
+    elseif cmd == "minimap" then
+        -- Unhide and reset the minimap button to its default edge position, for
+        -- when it was hidden or dragged off-screen.
+        LootTrackerDB = LootTrackerDB or {}
+        LootTrackerDB.minimap = LootTrackerDB.minimap or {}
+        LootTrackerDB.minimap.hide  = false
+        LootTrackerDB.minimap.angle = 200
+        if UpdateMinimapButton then UpdateMinimapButton() end
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffd200LootTracker|r: minimap button "
+            .. "reset to default position and shown.")
     else
-        DEFAULT_CHAT_FRAME:AddMessage("|cffffd200LootTracker|r: /lt [toggle|show|hide|reset|mock|mute|debug|logclear]")
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffd200LootTracker|r: /lt [toggle|show|hide|scanbag|reset|mock|mute|minimap|debug|logclear]")
     end
 end

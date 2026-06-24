@@ -2,10 +2,11 @@
 ## Title: Loot Tracker
 ## Notes: Tracks boss loot and /roll outcomes in dungeons and raids.
 ## Author: Nectura
-## Version: 1.0.0
+## Version: 1.1.0
 ## SavedVariablesPerCharacter: LootTrackerDB
+## OptionalDeps: AtlasLoot, AtlasLoot_OriginalWoW, AtlasLoot_BurningCrusade, AtlasLoot_WrathoftheLichKing
 
-Data\Bosses.lua
+Data\NPCBridge.lua
 Data\Currencies.lua
 Core.lua
 UI.lua
