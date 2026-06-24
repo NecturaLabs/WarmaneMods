@@ -1,7 +1,7 @@
 ## Interface: 30300
 ## Title: VendorEmblems
-## Notes: Sidebar extension on the right of the merchant frame listing every character currency and balance (grouped like the Character pane's Currency tab). Currencies the current vendor accepts are highlighted, and hovering shows which items they buy.
+## Notes: Sidebar extension on the right of the merchant frame listing every character currency and balance (grouped like the Character pane's Currency tab). Currencies the current vendor accepts are highlighted, and hovering shows which items they buy. Capped currencies (Honor, Arena) show current / max here and in the Currency tab, tinted red when full.
 ## Author: Itai
-## Version: 2.0.0
+## Version: 2.1.0
 
 VendorEmblems.lua

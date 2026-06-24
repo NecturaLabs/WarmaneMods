@@ -47,6 +47,8 @@ local BACKDROP_INSETS     = {
 local MIN_CONTENT_WIDTH   = 130
 
 local HIGHLIGHT_R, HIGHLIGHT_G, HIGHLIGHT_B = 1, 0.82, 0   -- WoW gold tint
+local CAPPED_R,    CAPPED_G,    CAPPED_B    = 1, 0.1,  0.1 -- red tint when a capped currency is full
+local BALANCE_R,   BALANCE_G,   BALANCE_B   = 1, 1,    1   -- normal balance text color
 
 local function ExtractItemID(link)
     if not link then return nil end
@@ -61,6 +63,44 @@ local function FormatBalance(n)
     local formatted = digits:reverse():gsub("(%d%d%d)", "%1,"):reverse()
     if formatted:sub(1, 1) == "," then formatted = formatted:sub(2) end
     return neg .. formatted
+end
+
+-- WotLK 3.3.5a holding caps, keyed by the extraCurrencyType field returned by
+-- GetCurrencyListInfo: 1 = Arena Points (cap 5,000), 2 = Honor Points
+-- (cap 75,000). Item-based currencies return 0 and have no holding cap. Adjust
+-- these values if your realm uses non-standard caps.
+local CURRENCY_CAPS = {
+    [1] = 5000,    -- Arena Points
+    [2] = 75000,   -- Honor Points
+}
+
+local function GetCurrencyCap(extraCurrencyType)
+    return extraCurrencyType and CURRENCY_CAPS[extraCurrencyType] or nil
+end
+
+-- Balance string for display: "current / max" for capped currencies, plain
+-- "current" otherwise.
+local function FormatBalanceWithCap(balance, cap)
+    if cap then
+        return FormatBalance(balance) .. " / " .. FormatBalance(cap)
+    end
+    return FormatBalance(balance)
+end
+
+-- Honor and Arena rows return an invalid icon from GetCurrencyListInfo, so we
+-- supply the same textures Blizzard's TokenFrame uses. Returns the texture path
+-- followed by its four TexCoord values, or nil to fall back to the API icon.
+local function GetExtraCurrencyIcon(extraCurrencyType)
+    if extraCurrencyType == 1 then            -- Arena Points
+        return "Interface\\PVPFrame\\PVP-ArenaPoints-Icon", 0, 1, 0, 1
+    elseif extraCurrencyType == 2 then        -- Honor Points
+        local faction = UnitFactionGroup("player")
+        if faction then
+            return "Interface\\TargetingFrame\\UI-PVP-" .. faction,
+                   0.03125, 0.59375, 0.03125, 0.59375
+        end
+    end
+    return nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -121,14 +161,18 @@ local function ScanCurrencies()
     local count = GetCurrencyListSize() or 0
     for i = 1, count do
         local name, isHeader, _isExpanded, isUnused, _isWatched, balance,
-              _extraCurrencyType, icon, itemID = GetCurrencyListInfo(i)
+              extraCurrencyType, icon, itemID = GetCurrencyListInfo(i)
         if name and not isUnused then
             entries[#entries + 1] = {
-                isHeader = isHeader,
-                name     = name,
-                icon     = icon,
-                balance  = balance or 0,
-                itemID   = itemID,
+                isHeader          = isHeader,
+                name              = name,
+                icon              = icon,
+                balance           = balance or 0,
+                -- Honor/Arena report an invalid (0/nil) itemID; normalise to nil
+                -- so the tooltip path and cost-map lookups skip them cleanly.
+                itemID            = (itemID and itemID > 0) and itemID or nil,
+                extraCurrencyType = extraCurrencyType,
+                cap               = GetCurrencyCap(extraCurrencyType),
             }
         end
     end
@@ -315,7 +359,7 @@ local function ComputeContentWidth(entries)
             if headerW > maxW then maxW = headerW end
         else
             nameMeasure:SetText(entry.name or "")
-            balanceMeasure:SetText(FormatBalance(entry.balance))
+            balanceMeasure:SetText(FormatBalanceWithCap(entry.balance, entry.cap))
             local rowW = (nameMeasure:GetStringWidth() or 0)
                        + NAME_BALANCE_GAP
                        + (balanceMeasure:GetStringWidth() or 0)
@@ -368,14 +412,36 @@ local function ApplyLayout(entries)
             currencyIdx = currencyIdx + 1
             local row = currencyPool[currencyIdx] or CreateCurrencyRow(currencyIdx)
             row.entry = entry
-            row.icon:SetTexture(entry.icon)
+
+            -- Icon: Honor/Arena need Blizzard's substitute textures and their own
+            -- crop; item-based currencies keep the default icon and crop. Set the
+            -- TexCoord every pass since rows are pooled and reused.
+            local iconTex, cl, cr, ct, cb = GetExtraCurrencyIcon(entry.extraCurrencyType)
+            if iconTex then
+                row.icon:SetTexture(iconTex)
+                row.icon:SetTexCoord(cl, cr, ct, cb)
+            else
+                row.icon:SetTexture(entry.icon)
+                row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+            end
+
             row.name:SetText(entry.name or "?")
             if entry.usedByItems and #entry.usedByItems > 0 then
                 row.name:SetTextColor(HIGHLIGHT_R, HIGHLIGHT_G, HIGHLIGHT_B)
             else
                 row.name:SetTextColor(1, 1, 1)
             end
-            row.balance:SetText(FormatBalance(entry.balance))
+
+            -- Balance: capped currencies show "current / max", tinted red once at
+            -- or over the cap. Colour is set every pass so a red value never sticks
+            -- to a pooled row reused for an uncapped currency.
+            row.balance:SetText(FormatBalanceWithCap(entry.balance, entry.cap))
+            if entry.cap and entry.balance >= entry.cap then
+                row.balance:SetTextColor(CAPPED_R, CAPPED_G, CAPPED_B)
+            else
+                row.balance:SetTextColor(BALANCE_R, BALANCE_G, BALANCE_B)
+            end
+
             row:SetWidth(innerW)
             row:ClearAllPoints()
             row:SetPoint("TOPLEFT", sidebar, "TOPLEFT", rowAreaLeft, y)
@@ -455,4 +521,58 @@ hooksecurefunc("MerchantFrame_Update", function()
     end
     ScheduleRefresh()
 end)
+
+-- ---------------------------------------------------------------------------
+-- Character pane Currency tab (Blizzard_TokenUI)
+-- ---------------------------------------------------------------------------
+-- Mirror the cap display onto Blizzard's own Currency tab. Blizzard_TokenUI is
+-- load-on-demand (loaded the first time the Currency tab is opened), so the
+-- TokenFrame_Update hook is installed only once that addon is present. The hook
+-- runs after Blizzard's update, rewriting the balance of capped rows in place.
+
+local function ApplyTokenFrameCaps()
+    local container = TokenFrameContainer
+    if not container or not container.buttons then return end
+    for _, button in ipairs(container.buttons) do
+        if button:IsShown() and not button.isHeader and button.index then
+            local _, _, _, _, _, count, extraCurrencyType = GetCurrencyListInfo(button.index)
+            local cap = GetCurrencyCap(extraCurrencyType)
+            if cap then
+                count = count or 0
+                button.count:SetText(FormatBalanceWithCap(count, cap))
+                -- Colour: red at/over cap, white below it. At zero we leave the
+                -- colour alone so Blizzard's greyed-out zero styling stands. A
+                -- stale red can't leak onto a recycled row because Blizzard's
+                -- TokenFrame_Update calls button.count:SetFontObject(...) on every
+                -- non-header row before this post-hook runs, which clears any
+                -- prior SetTextColor.
+                if count >= cap then
+                    button.count:SetTextColor(CAPPED_R, CAPPED_G, CAPPED_B)
+                elseif count > 0 then
+                    button.count:SetTextColor(BALANCE_R, BALANCE_G, BALANCE_B)
+                end
+            end
+        end
+    end
+end
+
+local tokenFrameHooked = false
+local function HookTokenFrame()
+    if tokenFrameHooked or type(TokenFrame_Update) ~= "function" then return end
+    hooksecurefunc("TokenFrame_Update", ApplyTokenFrameCaps)
+    tokenFrameHooked = true
+end
+
+if IsAddOnLoaded("Blizzard_TokenUI") then
+    HookTokenFrame()
+else
+    local tokenLoader = CreateFrame("Frame")
+    tokenLoader:RegisterEvent("ADDON_LOADED")
+    tokenLoader:SetScript("OnEvent", function(self, _, addonName)
+        if addonName == "Blizzard_TokenUI" then
+            HookTokenFrame()
+            self:UnregisterEvent("ADDON_LOADED")
+        end
+    end)
+end
 
